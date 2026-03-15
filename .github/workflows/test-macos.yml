@@ -1,4 +1,4 @@
-name: Test macOS
+name: Test All Platforms
 
 on:
   push:
@@ -16,8 +16,20 @@ env:
 
 jobs:
   test:
-    name: cargo test
-    runs-on: macos-latest
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            os: ubuntu-latest
+          - name: Windows x64
+            os: windows-latest
+          - name: macOS Intel
+            os: macos-26-intel
+          - name: macOS Apple Silicon
+            os: macos-latest
 
     steps:
       - name: Checkout source
