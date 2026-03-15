@@ -1,0 +1,71 @@
+name: Build All Platforms
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            os: ubuntu-latest
+            artifact_name: codextocc-linux-x86_64
+            binary_name: codextocc
+            packaged_name: codextocc-linux-x86_64
+          - name: Windows x64
+            os: windows-latest
+            artifact_name: codextocc-windows-x86_64
+            binary_name: codextocc.exe
+            packaged_name: codextocc-windows-x86_64.exe
+          - name: macOS Intel
+            os: macos-13
+            artifact_name: codextocc-macos-x86_64
+            binary_name: codextocc
+            packaged_name: codextocc-macos-x86_64
+          - name: macOS Apple Silicon
+            os: macos-14
+            artifact_name: codextocc-macos-aarch64
+            binary_name: codextocc
+            packaged_name: codextocc-macos-aarch64
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.binary_name }}" "dist/${{ matrix.packaged_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.packaged_name }}
+          if-no-files-found: error
