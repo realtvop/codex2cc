@@ -57,7 +57,7 @@ struct CachedCredential {
     modified: Option<SystemTime>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct LocalCodexAuthData {
     raw: Value,
     openai_api_key: Option<String>,
