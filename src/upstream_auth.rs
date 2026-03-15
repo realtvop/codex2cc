@@ -363,29 +363,38 @@ fn read_local_auth_file(path: &Path) -> anyhow::Result<LocalCodexAuthData> {
         fs::read_to_string(path).with_context(|| format!("failed reading {}", path.display()))?;
     let raw: Value = serde_json::from_str(&contents)
         .with_context(|| format!("failed parsing {}", path.display()))?;
-    let object = raw
-        .as_object()
-        .ok_or_else(|| anyhow!("local Codex auth file root must be a JSON object"))?;
+    let (openai_api_key, access_token, refresh_token, id_token) = {
+        let object = raw
+            .as_object()
+            .ok_or_else(|| anyhow!("local Codex auth file root must be a JSON object"))?;
+        let tokens = object.get("tokens").and_then(Value::as_object);
 
-    let tokens = object.get("tokens").and_then(Value::as_object);
+        (
+            object
+                .get("OPENAI_API_KEY")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            tokens
+                .and_then(|tokens| tokens.get("access_token"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            tokens
+                .and_then(|tokens| tokens.get("refresh_token"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            tokens
+                .and_then(|tokens| tokens.get("id_token"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        )
+    };
+
     Ok(LocalCodexAuthData {
         raw,
-        openai_api_key: object
-            .get("OPENAI_API_KEY")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        access_token: tokens
-            .and_then(|tokens| tokens.get("access_token"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        refresh_token: tokens
-            .and_then(|tokens| tokens.get("refresh_token"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        id_token: tokens
-            .and_then(|tokens| tokens.get("id_token"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        openai_api_key,
+        access_token,
+        refresh_token,
+        id_token,
     })
 }
 
