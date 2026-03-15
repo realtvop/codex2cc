@@ -386,25 +386,29 @@ async fn execute_upstream_request(
     body: &Value,
     timeout: Option<Duration>,
 ) -> Result<reqwest::Response, reqwest::Error> {
+    let base_body = body.clone();
     let mut credential = state.upstream_auth.resolve_primary().await;
+    let mut request_body = prepare_upstream_body(&base_body, &credential);
     let mut url = join_upstream_url(
         upstream_base_url(&state.config.upstream, &credential),
         endpoint,
     );
     let mut response =
-        send_upstream_request(&state.client, &url, body, timeout, &credential).await?;
+        send_upstream_request(&state.client, &url, &request_body, timeout, &credential).await?;
 
     if is_auth_error(response.status())
         && credential.source == CredentialSource::LocalCodexAccessToken
     {
         if let Some(refreshed) = state.upstream_auth.resolve_after_token_unauthorized().await {
             info!("retrying upstream request with refreshed local Codex access token");
+            request_body = prepare_upstream_body(&base_body, &refreshed);
             url = join_upstream_url(
                 upstream_base_url(&state.config.upstream, &refreshed),
                 endpoint,
             );
             response =
-                send_upstream_request(&state.client, &url, body, timeout, &refreshed).await?;
+                send_upstream_request(&state.client, &url, &request_body, timeout, &refreshed)
+                    .await?;
             credential = refreshed;
         }
     }
@@ -412,12 +416,14 @@ async fn execute_upstream_request(
     if is_auth_error(response.status()) && credential.source.is_local() {
         if let Some(configured) = state.upstream_auth.configured_api_key_fallback(&credential) {
             info!("retrying upstream request with configured API key fallback");
+            request_body = prepare_upstream_body(&base_body, &configured);
             url = join_upstream_url(
                 upstream_base_url(&state.config.upstream, &configured),
                 endpoint,
             );
             response =
-                send_upstream_request(&state.client, &url, body, timeout, &configured).await?;
+                send_upstream_request(&state.client, &url, &request_body, timeout, &configured)
+                    .await?;
         }
     }
 
@@ -482,6 +488,18 @@ fn upstream_base_url<'a>(
     } else {
         &config.base_url
     }
+}
+
+fn prepare_upstream_body(body: &Value, credential: &ResolvedCredential) -> Value {
+    if !credential.source.is_local() {
+        return body.clone();
+    }
+    if let Some(object) = body.as_object() {
+        let mut clone = object.clone();
+        clone.remove("max_output_tokens");
+        return Value::Object(clone);
+    }
+    body.clone()
 }
 
 fn is_auth_error(status: StatusCode) -> bool {
@@ -689,6 +707,31 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("acct-123")
         );
+    }
+
+    #[test]
+    fn prepare_upstream_body_strips_max_output_tokens_for_local_credential() {
+        let body = json!({"max_output_tokens": 10, "other": 1});
+
+        let local = prepare_upstream_body(
+            &body,
+            &ResolvedCredential {
+                token: "t".to_string(),
+                source: CredentialSource::LocalCodexAccessToken,
+                account_id: None,
+            },
+        );
+        assert_eq!(local, json!({"other": 1}));
+
+        let configured = prepare_upstream_body(
+            &body,
+            &ResolvedCredential {
+                token: "t".to_string(),
+                source: CredentialSource::ConfigApiKey,
+                account_id: None,
+            },
+        );
+        assert_eq!(configured, body);
     }
 
     #[test]

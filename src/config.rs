@@ -354,6 +354,7 @@ mod tests {
 
     #[test]
     fn load_from_path_reads_existing_config_without_rewriting() {
+        env::remove_var("OPENAI_BASE_URL");
         let workspace = TestWorkspace::new();
         let path = workspace.path("config.yaml");
         let contents = r#"
