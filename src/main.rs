@@ -14,7 +14,7 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
-use config::AppConfig;
+use config::{AppConfig, ConfigLoad};
 use converter::{
     anthropic_to_openai_request, build_error_data, openai_to_anthropic_response, StreamConverter,
 };
@@ -38,7 +38,16 @@ struct AppState {
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
-    let config = Arc::new(AppConfig::load()?);
+    let config = match AppConfig::load()? {
+        ConfigLoad::Loaded(config) => Arc::new(config),
+        ConfigLoad::Generated { path } => {
+            info!(
+                path = %path.display(),
+                "configuration file was missing; generated default config and exiting"
+            );
+            return Ok(());
+        }
+    };
     let client = Client::builder()
         .timeout(Duration::from_secs(600))
         .build()?;

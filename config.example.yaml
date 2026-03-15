@@ -3,21 +3,18 @@ server:
   port: 8082
 
 api_keys:
-  - "client-proxy-key"
+  - "0123456789abcdef0123456789abcdef"
 
 upstream:
   base_url: "https://api.openai.com/v1"
-  api_key: "configured-openai-api-key"
+  api_key: ""
+  prefer_local_codex_credentials: true
+  local_codex_auth_path: "~/.codex/auth.json"
+  refresh_local_codex_tokens: true
 
-model_map:
-  claude-3-5-sonnet-20241022: "gpt-5.4"
+model_map: {}
 
-# Example: prefer configured upstream API key only
-# upstream:
-#   base_url: "https://api.openai.com/v1"
-#   api_key: "configured-openai-api-key"
-
-# Example: prefer local Codex credentials and fall back to configured API key
+# Optional fallback API key if local Codex credentials are unavailable:
 # upstream:
 #   base_url: "https://api.openai.com/v1"
 #   api_key: "configured-openai-api-key"

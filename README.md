@@ -6,6 +6,8 @@ Rust proxy that translates Anthropic-style `/v1/messages` requests into OpenAI R
 
 The server loads configuration from `config.yaml` by default. Set `CONFIG_PATH` to use a different file.
 
+If the configured path does not exist at startup, the server generates a new config file, writes a random 32-character lowercase hex client API key to `api_keys`, enables local Codex credential lookup, and exits immediately. The generated key is only written to the config file, not printed to the terminal.
+
 Environment variables override YAML values when both are present.
 
 ### Server fields
@@ -18,7 +20,7 @@ Environment variables override YAML values when both are present.
 ### Client auth fields
 
 - `api_keys`
-  Optional list of client API keys accepted by this proxy. If omitted or empty, client auth is disabled.
+  Optional list of client API keys accepted by this proxy. If omitted or empty, client auth is disabled. Auto-generated configs include one random key by default.
 
 ### Upstream fields
 
@@ -31,6 +33,7 @@ Environment variables override YAML values when both are present.
 - `upstream.prefer_local_codex_credentials`
   Default: `false`
   Env override: `PREFER_LOCAL_CODEX_CREDENTIALS`
+  Auto-generated configs set this to `true`
 - `upstream.local_codex_auth_path`
   Default: `~/.codex/auth.json`
   Env override: `LOCAL_CODEX_AUTH_PATH`
@@ -47,6 +50,8 @@ Environment variables override YAML values when both are present.
 ## Local Codex Credentials
 
 This proxy can optionally read upstream credentials from the local Codex credential file, which is `~/.codex/auth.json` by default.
+
+Auto-generated configs enable this behavior on the next startup and leave `upstream.api_key` empty as an optional fallback you can add later.
 
 Supported fields from that file:
 
