@@ -497,6 +497,7 @@ fn prepare_upstream_body(body: &Value, credential: &ResolvedCredential) -> Value
     if let Some(object) = body.as_object() {
         let mut clone = object.clone();
         clone.remove("max_output_tokens");
+        clone.remove("temperature");
         return Value::Object(clone);
     }
     body.clone()
@@ -711,7 +712,7 @@ mod tests {
 
     #[test]
     fn prepare_upstream_body_strips_max_output_tokens_for_local_credential() {
-        let body = json!({"max_output_tokens": 10, "other": 1});
+        let body = json!({"max_output_tokens": 10, "temperature": 0.7, "other": 1});
 
         let local = prepare_upstream_body(
             &body,
