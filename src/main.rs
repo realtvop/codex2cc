@@ -14,7 +14,7 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
-use config::{AppConfig, ConfigLoad};
+use config::{AppConfig, ConfigLoad, DEFAULT_CODEX_BASE_URL};
 use converter::{
     anthropic_to_openai_request, build_error_data, openai_to_anthropic_response, StreamConverter,
 };
@@ -58,6 +58,11 @@ async fn main() -> anyhow::Result<()> {
         host = %config.server.host,
         port = config.server.port,
         upstream = %config.upstream.base_url,
+        codex_upstream = %config
+            .upstream
+            .codex_base_url
+            .as_deref()
+            .unwrap_or(DEFAULT_CODEX_BASE_URL),
         auth_enabled = config.auth_enabled(),
         prefer_local_codex_credentials = config.upstream.prefer_local_codex_credentials,
         "starting Rust proxy server"
@@ -381,8 +386,11 @@ async fn execute_upstream_request(
     body: &Value,
     timeout: Option<Duration>,
 ) -> Result<reqwest::Response, reqwest::Error> {
-    let url = join_upstream_url(&state.config.upstream.base_url, endpoint);
     let mut credential = state.upstream_auth.resolve_primary().await;
+    let mut url = join_upstream_url(
+        upstream_base_url(&state.config.upstream, &credential),
+        endpoint,
+    );
     let mut response =
         send_upstream_request(&state.client, &url, body, timeout, &credential).await?;
 
@@ -391,6 +399,10 @@ async fn execute_upstream_request(
     {
         if let Some(refreshed) = state.upstream_auth.resolve_after_token_unauthorized().await {
             info!("retrying upstream request with refreshed local Codex access token");
+            url = join_upstream_url(
+                upstream_base_url(&state.config.upstream, &refreshed),
+                endpoint,
+            );
             response =
                 send_upstream_request(&state.client, &url, body, timeout, &refreshed).await?;
             credential = refreshed;
@@ -400,6 +412,10 @@ async fn execute_upstream_request(
     if is_auth_error(response.status()) && credential.source.is_local() {
         if let Some(configured) = state.upstream_auth.configured_api_key_fallback(&credential) {
             info!("retrying upstream request with configured API key fallback");
+            url = join_upstream_url(
+                upstream_base_url(&state.config.upstream, &configured),
+                endpoint,
+            );
             response =
                 send_upstream_request(&state.client, &url, body, timeout, &configured).await?;
         }
@@ -432,6 +448,18 @@ fn upstream_headers(credential: &ResolvedCredential) -> HeaderMap {
         "authorization",
         HeaderValue::from_str(&bearer).unwrap_or_else(|_| HeaderValue::from_static("Bearer ")),
     );
+    if credential.source.is_local() {
+        headers.insert(
+            "openai-beta",
+            HeaderValue::from_static("responses=experimental"),
+        );
+        headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+        if let Some(account_id) = credential.account_id.as_deref() {
+            if let Ok(value) = HeaderValue::from_str(account_id) {
+                headers.insert("chatgpt-account-id", value);
+            }
+        }
+    }
     headers.insert("content-type", HeaderValue::from_static("application/json"));
     headers
 }
@@ -440,6 +468,20 @@ fn join_upstream_url(base_url: &str, endpoint: &str) -> String {
     let base = base_url.trim_end_matches('/');
     let suffix = endpoint.trim_start_matches('/');
     format!("{base}/{suffix}")
+}
+
+fn upstream_base_url<'a>(
+    config: &'a config::UpstreamConfig,
+    credential: &ResolvedCredential,
+) -> &'a str {
+    if credential.source.is_local() {
+        config
+            .codex_base_url
+            .as_deref()
+            .unwrap_or(DEFAULT_CODEX_BASE_URL)
+    } else {
+        &config.base_url
+    }
 }
 
 fn is_auth_error(status: StatusCode) -> bool {
@@ -577,9 +619,36 @@ mod tests {
                 refresh_local_codex_tokens: true,
                 local_codex_oauth_client_id: None,
                 local_codex_oauth_token_endpoint: None,
+                codex_base_url: Some(DEFAULT_CODEX_BASE_URL.to_string()),
             },
             model_map: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn upstream_base_url_prefers_codex_for_local_credentials() {
+        let mut config = sample_config(&[]);
+        config.upstream.codex_base_url = Some("https://chatgpt.example".to_string());
+
+        let local_credential = ResolvedCredential {
+            token: "token".to_string(),
+            source: CredentialSource::LocalCodexAccessToken,
+            account_id: None,
+        };
+        let configured_credential = ResolvedCredential {
+            token: "token".to_string(),
+            source: CredentialSource::ConfigApiKey,
+            account_id: None,
+        };
+
+        assert_eq!(
+            upstream_base_url(&config.upstream, &local_credential),
+            "https://chatgpt.example"
+        );
+        assert_eq!(
+            upstream_base_url(&config.upstream, &configured_credential),
+            config.upstream.base_url
+        );
     }
 
     #[test]
@@ -591,6 +660,34 @@ mod tests {
         assert_eq!(
             join_upstream_url("https://api.openai.com/v1", "responses"),
             "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn upstream_headers_add_codex_metadata_for_local_credentials() {
+        let headers = upstream_headers(&ResolvedCredential {
+            token: "token".to_string(),
+            source: CredentialSource::LocalCodexAccessToken,
+            account_id: Some("acct-123".to_string()),
+        });
+
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer token")
+        );
+        assert_eq!(
+            headers
+                .get("openai-beta")
+                .and_then(|value| value.to_str().ok()),
+            Some("responses=experimental")
+        );
+        assert_eq!(
+            headers
+                .get("chatgpt-account-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("acct-123")
         );
     }
 

@@ -46,6 +46,10 @@ Environment variables override YAML values when both are present.
 - `upstream.local_codex_oauth_token_endpoint`
   Default: discovered from OpenID configuration
   Env override: `LOCAL_CODEX_OAUTH_TOKEN_ENDPOINT`
+- `upstream.codex_base_url`
+  Default: `https://chatgpt.com/backend-api/codex`
+  Env override: `CODEX_BASE_URL`
+  Used when sending requests with local Codex OAuth credentials to avoid missing `api.responses.*` scopes.
 
 ## Local Codex Credentials
 

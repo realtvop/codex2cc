@@ -35,6 +35,7 @@ impl CredentialSource {
 pub struct ResolvedCredential {
     pub token: String,
     pub source: CredentialSource,
+    pub account_id: Option<String>,
 }
 
 pub struct UpstreamAuthManager {
@@ -55,6 +56,7 @@ struct CachedCredential {
     source: CredentialSource,
     expires_at: Option<SystemTime>,
     modified: Option<SystemTime>,
+    account_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +66,7 @@ struct LocalCodexAuthData {
     access_token: Option<String>,
     refresh_token: Option<String>,
     id_token: Option<String>,
+    account_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +87,8 @@ struct JwtClaims {
     exp: Option<u64>,
     #[serde(default)]
     aud: Option<AudienceClaim>,
+    #[serde(default)]
+    sub: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,6 +167,7 @@ impl UpstreamAuthManager {
         ResolvedCredential {
             token: self.config.api_key.clone(),
             source: CredentialSource::ConfigApiKey,
+            account_id: None,
         }
     }
 
@@ -186,6 +192,8 @@ impl UpstreamAuthManager {
             }
         };
 
+        let account_id = derive_account_id(&auth);
+
         if let Some(api_key) = auth
             .openai_api_key
             .clone()
@@ -194,12 +202,14 @@ impl UpstreamAuthManager {
             let credential = ResolvedCredential {
                 token: api_key.clone(),
                 source: CredentialSource::LocalCodexApiKey,
+                account_id: account_id.clone(),
             };
             self.set_cached(Some(CachedCredential {
                 token: api_key,
                 source: CredentialSource::LocalCodexApiKey,
                 expires_at: None,
                 modified,
+                account_id,
             }))
             .await;
             return Ok(Some(credential));
@@ -217,12 +227,14 @@ impl UpstreamAuthManager {
                     let credential = ResolvedCredential {
                         token: token.clone(),
                         source: CredentialSource::LocalCodexAccessToken,
+                        account_id: account_id.clone(),
                     };
                     self.set_cached(Some(CachedCredential {
                         token,
                         source: CredentialSource::LocalCodexAccessToken,
                         expires_at,
                         modified,
+                        account_id,
                     }))
                     .await;
                     return Ok(Some(credential));
@@ -251,6 +263,7 @@ impl UpstreamAuthManager {
         Some(ResolvedCredential {
             token: cached.token.clone(),
             source: cached.source.clone(),
+            account_id: cached.account_id.clone(),
         })
     }
 
@@ -305,9 +318,11 @@ impl UpstreamAuthManager {
         let id_token = refreshed.id_token.or_else(|| auth.id_token.clone());
         let expires_at =
             jwt_expiry(&access_token).or_else(|| id_token.as_deref().and_then(jwt_expiry));
+        let account_id = derive_account_id(auth);
         let credential = ResolvedCredential {
             token: access_token.clone(),
             source: CredentialSource::LocalCodexAccessToken,
+            account_id: account_id.clone(),
         };
 
         self.set_cached(Some(CachedCredential {
@@ -315,6 +330,7 @@ impl UpstreamAuthManager {
             source: CredentialSource::LocalCodexAccessToken,
             expires_at,
             modified,
+            account_id,
         }))
         .await;
 
@@ -363,7 +379,7 @@ fn read_local_auth_file(path: &Path) -> anyhow::Result<LocalCodexAuthData> {
         fs::read_to_string(path).with_context(|| format!("failed reading {}", path.display()))?;
     let raw: Value = serde_json::from_str(&contents)
         .with_context(|| format!("failed parsing {}", path.display()))?;
-    let (openai_api_key, access_token, refresh_token, id_token) = {
+    let (openai_api_key, access_token, refresh_token, id_token, account_id) = {
         let object = raw
             .as_object()
             .ok_or_else(|| anyhow!("local Codex auth file root must be a JSON object"))?;
@@ -386,6 +402,16 @@ fn read_local_auth_file(path: &Path) -> anyhow::Result<LocalCodexAuthData> {
                 .and_then(|tokens| tokens.get("id_token"))
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            tokens
+                .and_then(|tokens| tokens.get("account_id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    object
+                        .get("account_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                }),
         )
     };
 
@@ -395,6 +421,7 @@ fn read_local_auth_file(path: &Path) -> anyhow::Result<LocalCodexAuthData> {
         access_token,
         refresh_token,
         id_token,
+        account_id,
     })
 }
 
@@ -494,6 +521,10 @@ fn jwt_audience(token: &str) -> Option<String> {
     }
 }
 
+fn jwt_subject(token: &str) -> Option<String> {
+    decode_jwt_claims(token).ok()?.sub
+}
+
 fn decode_jwt_claims(token: &str) -> anyhow::Result<JwtClaims> {
     let payload = token
         .split('.')
@@ -515,6 +546,13 @@ fn expires_soon(expires_at: Option<SystemTime>) -> bool {
     }
 }
 
+fn derive_account_id(auth: &LocalCodexAuthData) -> Option<String> {
+    auth.account_id
+        .clone()
+        .filter(|value| !value.is_empty())
+        .or_else(|| auth.id_token.as_deref().and_then(jwt_subject))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,6 +567,7 @@ mod tests {
             refresh_local_codex_tokens: true,
             local_codex_oauth_client_id: None,
             local_codex_oauth_token_endpoint: None,
+            codex_base_url: None,
         }
     }
 
@@ -568,6 +607,7 @@ mod tests {
         let fallback = manager.configured_api_key_fallback(&ResolvedCredential {
             token: "local-token".to_string(),
             source: CredentialSource::LocalCodexAccessToken,
+            account_id: None,
         });
         let fallback = fallback.expect("expected configured key fallback");
         assert_eq!(fallback.token, "configured");
@@ -577,12 +617,14 @@ mod tests {
             .configured_api_key_fallback(&ResolvedCredential {
                 token: "configured".to_string(),
                 source: CredentialSource::LocalCodexApiKey,
+                account_id: None,
             })
             .is_none());
         assert!(manager
             .configured_api_key_fallback(&ResolvedCredential {
                 token: "configured".to_string(),
                 source: CredentialSource::ConfigApiKey,
+                account_id: None,
             })
             .is_none());
 
@@ -591,6 +633,7 @@ mod tests {
             .configured_api_key_fallback(&ResolvedCredential {
                 token: "local-token".to_string(),
                 source: CredentialSource::LocalCodexAccessToken,
+                account_id: None,
             })
             .is_none());
     }
@@ -623,6 +666,7 @@ mod tests {
             r#"{
                 "OPENAI_API_KEY": "sk-local",
                 "tokens": {
+                    "account_id": "acc-1",
                     "access_token": "access",
                     "refresh_token": "refresh",
                     "id_token": "id-token"
@@ -635,6 +679,7 @@ mod tests {
         assert_eq!(auth.access_token.as_deref(), Some("access"));
         assert_eq!(auth.refresh_token.as_deref(), Some("refresh"));
         assert_eq!(auth.id_token.as_deref(), Some("id-token"));
+        assert_eq!(auth.account_id.as_deref(), Some("acc-1"));
 
         let _ = fs::remove_file(path);
     }
@@ -656,6 +701,37 @@ mod tests {
     }
 
     #[test]
+    fn derive_account_id_prefers_explicit_and_id_token_subject() {
+        let id_token = encode_jwt(json!({ "sub": "user-subject" }));
+
+        let with_id_token = LocalCodexAuthData {
+            raw: json!({}),
+            openai_api_key: None,
+            access_token: None,
+            refresh_token: None,
+            id_token: Some(id_token.clone()),
+            account_id: None,
+        };
+        assert_eq!(
+            derive_account_id(&with_id_token),
+            Some("user-subject".to_string())
+        );
+
+        let explicit_account = LocalCodexAuthData {
+            raw: json!({}),
+            openai_api_key: None,
+            access_token: None,
+            refresh_token: None,
+            id_token: Some(id_token),
+            account_id: Some("acc-explicit".to_string()),
+        };
+        assert_eq!(
+            derive_account_id(&explicit_account),
+            Some("acc-explicit".to_string())
+        );
+    }
+
+    #[test]
     fn update_local_auth_json_preserves_missing_optional_tokens() {
         let mut auth = LocalCodexAuthData {
             raw: json!({
@@ -669,6 +745,7 @@ mod tests {
             access_token: Some("old-access".to_string()),
             refresh_token: Some("old-refresh".to_string()),
             id_token: Some("old-id".to_string()),
+            account_id: None,
         };
 
         update_local_auth_json(
@@ -697,6 +774,7 @@ mod tests {
             access_token: None,
             refresh_token: None,
             id_token: None,
+            account_id: None,
         };
 
         update_local_auth_json(

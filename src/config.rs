@@ -9,6 +9,9 @@ use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub const DEFAULT_UPSTREAM_BASE_URL: &str = "https://api.openai.com/v1";
+pub const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub server: ServerConfig,
@@ -32,6 +35,7 @@ pub struct UpstreamConfig {
     pub refresh_local_codex_tokens: bool,
     pub local_codex_oauth_client_id: Option<String>,
     pub local_codex_oauth_token_endpoint: Option<String>,
+    pub codex_base_url: Option<String>,
 }
 
 #[derive(Debug)]
@@ -76,6 +80,8 @@ struct RawUpstreamConfig {
     local_codex_oauth_client_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     local_codex_oauth_token_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codex_base_url: Option<String>,
 }
 
 impl AppConfig {
@@ -121,7 +127,7 @@ impl AppConfig {
                 base_url: env::var("OPENAI_BASE_URL")
                     .ok()
                     .or(upstream.base_url)
-                    .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+                    .unwrap_or_else(|| DEFAULT_UPSTREAM_BASE_URL.to_string()),
                 api_key: env::var("OPENAI_API_KEY")
                     .ok()
                     .or(upstream.api_key)
@@ -143,6 +149,10 @@ impl AppConfig {
                 local_codex_oauth_token_endpoint: env::var("LOCAL_CODEX_OAUTH_TOKEN_ENDPOINT")
                     .ok()
                     .or(upstream.local_codex_oauth_token_endpoint)
+                    .filter(|value| !value.is_empty()),
+                codex_base_url: env::var("CODEX_BASE_URL")
+                    .ok()
+                    .or(upstream.codex_base_url)
                     .filter(|value| !value.is_empty()),
             },
             model_map: raw.model_map.unwrap_or_default(),
@@ -171,13 +181,14 @@ fn generate_default_config(path: &Path) -> anyhow::Result<()> {
         }),
         api_keys: Some(vec![generate_client_api_key()]),
         upstream: Some(RawUpstreamConfig {
-            base_url: Some("https://api.openai.com/v1".to_string()),
+            base_url: Some(DEFAULT_UPSTREAM_BASE_URL.to_string()),
             api_key: Some(String::new()),
             prefer_local_codex_credentials: Some(true),
             local_codex_auth_path: Some("~/.codex/auth.json".to_string()),
             refresh_local_codex_tokens: Some(true),
             local_codex_oauth_client_id: None,
             local_codex_oauth_token_endpoint: None,
+            codex_base_url: Some(DEFAULT_CODEX_BASE_URL.to_string()),
         }),
         model_map: Some(HashMap::new()),
     };
@@ -226,13 +237,14 @@ mod tests {
             },
             api_keys: api_keys.iter().map(|key| (*key).to_string()).collect(),
             upstream: UpstreamConfig {
-                base_url: "https://api.openai.com/v1".to_string(),
+                base_url: DEFAULT_UPSTREAM_BASE_URL.to_string(),
                 api_key: "configured-key".to_string(),
                 prefer_local_codex_credentials: false,
                 local_codex_auth_path: "~/.codex/auth.json".to_string(),
                 refresh_local_codex_tokens: true,
                 local_codex_oauth_client_id: None,
                 local_codex_oauth_token_endpoint: None,
+                codex_base_url: Some(DEFAULT_CODEX_BASE_URL.to_string()),
             },
             model_map: HashMap::new(),
         }
@@ -323,7 +335,7 @@ mod tests {
         let upstream = raw.upstream.expect("missing upstream");
         assert_eq!(
             upstream.base_url.as_deref(),
-            Some("https://api.openai.com/v1")
+            Some(DEFAULT_UPSTREAM_BASE_URL)
         );
         assert_eq!(upstream.api_key.as_deref(), Some(""));
         assert_eq!(upstream.prefer_local_codex_credentials, Some(true));
@@ -332,6 +344,10 @@ mod tests {
             Some("~/.codex/auth.json")
         );
         assert_eq!(upstream.refresh_local_codex_tokens, Some(true));
+        assert_eq!(
+            upstream.codex_base_url.as_deref(),
+            Some(DEFAULT_CODEX_BASE_URL)
+        );
 
         assert!(raw.model_map.expect("missing model_map").is_empty());
     }
@@ -365,6 +381,7 @@ model_map:
         assert_eq!(config.api_keys, HashSet::from(["secret".to_string()]));
         assert_eq!(config.upstream.base_url, "https://example.com/v1");
         assert!(!config.upstream.prefer_local_codex_credentials);
+        assert_eq!(config.upstream.codex_base_url, None);
         assert_eq!(
             config.model_map.get("claude").map(String::as_str),
             Some("gpt")
