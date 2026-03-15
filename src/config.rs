@@ -126,3 +126,60 @@ fn parse_bool(value: &str) -> Option<bool> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    fn sample_config(api_keys: &[&str]) -> AppConfig {
+        AppConfig {
+            server: ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 8082,
+            },
+            api_keys: api_keys.iter().map(|key| (*key).to_string()).collect(),
+            upstream: UpstreamConfig {
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key: "configured-key".to_string(),
+                prefer_local_codex_credentials: false,
+                local_codex_auth_path: "~/.codex/auth.json".to_string(),
+                refresh_local_codex_tokens: true,
+                local_codex_oauth_client_id: None,
+                local_codex_oauth_token_endpoint: None,
+            },
+            model_map: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn parse_bool_accepts_true_values() {
+        for value in ["1", "true", "TRUE", " yes ", "On"] {
+            assert_eq!(parse_bool(value), Some(true), "value: {value}");
+        }
+    }
+
+    #[test]
+    fn parse_bool_accepts_false_values() {
+        for value in ["0", "false", "FALSE", " no ", "Off"] {
+            assert_eq!(parse_bool(value), Some(false), "value: {value}");
+        }
+    }
+
+    #[test]
+    fn parse_bool_rejects_invalid_values() {
+        for value in ["", "2", "truthy", "disabled"] {
+            assert_eq!(parse_bool(value), None, "value: {value}");
+        }
+    }
+
+    #[test]
+    fn auth_enabled_reflects_api_keys_presence() {
+        assert!(!sample_config(&[]).auth_enabled());
+        assert!(sample_config(&["secret"]).auth_enabled());
+
+        let config = sample_config(&["secret", "secret", "other"]);
+        let expected = HashSet::from(["secret".to_string(), "other".to_string()]);
+        assert_eq!(config.api_keys, expected);
+    }
+}

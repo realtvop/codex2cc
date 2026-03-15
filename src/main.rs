@@ -546,3 +546,104 @@ fn truncate_str(value: &str) -> String {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::{HashMap, HashSet};
+
+    fn sample_config(api_keys: &[&str]) -> AppConfig {
+        AppConfig {
+            server: config::ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 8082,
+            },
+            api_keys: api_keys.iter().map(|key| (*key).to_string()).collect(),
+            upstream: config::UpstreamConfig {
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key: "configured-key".to_string(),
+                prefer_local_codex_credentials: false,
+                local_codex_auth_path: "~/.codex/auth.json".to_string(),
+                refresh_local_codex_tokens: true,
+                local_codex_oauth_client_id: None,
+                local_codex_oauth_token_endpoint: None,
+            },
+            model_map: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn join_upstream_url_normalizes_slashes() {
+        assert_eq!(
+            join_upstream_url("https://api.openai.com/v1/", "/responses"),
+            "https://api.openai.com/v1/responses"
+        );
+        assert_eq!(
+            join_upstream_url("https://api.openai.com/v1", "responses"),
+            "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn get_client_key_prefers_x_api_key_then_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("header-key"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer bearer-key"),
+        );
+        assert_eq!(get_client_key(&headers), "header-key");
+
+        let mut bearer_only = HeaderMap::new();
+        bearer_only.insert(
+            "authorization",
+            HeaderValue::from_static("bEaReR mixed-case"),
+        );
+        assert_eq!(get_client_key(&bearer_only), "mixed-case");
+
+        assert_eq!(get_client_key(&HeaderMap::new()), "");
+    }
+
+    #[test]
+    fn check_auth_respects_disabled_and_matching_keys() {
+        assert!(check_auth(&sample_config(&[]), &HeaderMap::new()).is_none());
+
+        let config = sample_config(&["secret"]);
+        let mut valid_headers = HeaderMap::new();
+        valid_headers.insert("x-api-key", HeaderValue::from_static("secret"));
+        assert!(check_auth(&config, &valid_headers).is_none());
+
+        let mut invalid_headers = HeaderMap::new();
+        invalid_headers.insert("authorization", HeaderValue::from_static("Bearer wrong"));
+        let response = check_auth(&config, &invalid_headers).expect("expected auth failure");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn estimate_tokens_from_body_counts_relevant_text() {
+        let tool = json!({"name": "lookup", "description": "desc"});
+        let body = json!({
+            "system": [{"text": "abcd"}, {"text": "ef"}],
+            "messages": [
+                {"content": "12345678"},
+                {"content": [
+                    {"type": "text", "text": "wxyz"},
+                    {"type": "tool_result", "content": "tool-output"}
+                ]}
+            ],
+            "tools": [tool.clone()]
+        });
+
+        let total_chars =
+            4 + 2 + 8 + 4 + "tool-output".len() + serde_json::to_string(&tool).unwrap().len();
+        assert_eq!(estimate_tokens_from_body(&body), (total_chars / 4) as i64);
+    }
+
+    #[test]
+    fn sample_config_deduplicates_api_keys() {
+        let config = sample_config(&["secret", "secret", "other"]);
+        let expected = HashSet::from(["secret".to_string(), "other".to_string()]);
+        assert_eq!(config.api_keys, expected);
+    }
+}

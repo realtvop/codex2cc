@@ -505,3 +505,206 @@ fn expires_soon(expires_at: Option<SystemTime>) -> bool {
         None => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn sample_config(api_key: &str) -> UpstreamConfig {
+        UpstreamConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: api_key.to_string(),
+            prefer_local_codex_credentials: false,
+            local_codex_auth_path: "~/.codex/auth.json".to_string(),
+            refresh_local_codex_tokens: true,
+            local_codex_oauth_client_id: None,
+            local_codex_oauth_token_endpoint: None,
+        }
+    }
+
+    fn temp_path(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "codextocc-{label}-{}-{unique}.json",
+            std::process::id()
+        ))
+    }
+
+    fn write_temp_file(label: &str, contents: &str) -> PathBuf {
+        let path = temp_path(label);
+        fs::write(&path, contents).expect("failed to write temp file");
+        path
+    }
+
+    fn encode_jwt(claims: Value) -> String {
+        let payload = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
+        format!("header.{payload}.signature")
+    }
+
+    #[test]
+    fn credential_source_identifies_local_variants() {
+        assert!(!CredentialSource::ConfigApiKey.is_local());
+        assert!(CredentialSource::LocalCodexApiKey.is_local());
+        assert!(CredentialSource::LocalCodexAccessToken.is_local());
+    }
+
+    #[test]
+    fn configured_api_key_fallback_only_returns_distinct_configured_token() {
+        let manager = UpstreamAuthManager::new(sample_config("configured"), Client::new());
+
+        let fallback = manager.configured_api_key_fallback(&ResolvedCredential {
+            token: "local-token".to_string(),
+            source: CredentialSource::LocalCodexAccessToken,
+        });
+        let fallback = fallback.expect("expected configured key fallback");
+        assert_eq!(fallback.token, "configured");
+        assert_eq!(fallback.source, CredentialSource::ConfigApiKey);
+
+        assert!(manager
+            .configured_api_key_fallback(&ResolvedCredential {
+                token: "configured".to_string(),
+                source: CredentialSource::LocalCodexApiKey,
+            })
+            .is_none());
+        assert!(manager
+            .configured_api_key_fallback(&ResolvedCredential {
+                token: "configured".to_string(),
+                source: CredentialSource::ConfigApiKey,
+            })
+            .is_none());
+
+        let no_config = UpstreamAuthManager::new(sample_config(""), Client::new());
+        assert!(no_config
+            .configured_api_key_fallback(&ResolvedCredential {
+                token: "local-token".to_string(),
+                source: CredentialSource::LocalCodexAccessToken,
+            })
+            .is_none());
+    }
+
+    #[test]
+    fn jwt_helpers_decode_expiry_and_audience() {
+        let token = encode_jwt(json!({
+            "exp": 1_700_000_000u64,
+            "aud": ["client-id", "other-client"]
+        }));
+
+        assert_eq!(
+            jwt_expiry(&token),
+            Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+        );
+        assert_eq!(jwt_audience(&token), Some("client-id".to_string()));
+    }
+
+    #[test]
+    fn jwt_helpers_reject_invalid_tokens() {
+        assert!(jwt_expiry("missing-payload").is_none());
+        assert!(jwt_audience("header.not-base64.signature").is_none());
+        assert!(decode_jwt_claims("header.not-base64.signature").is_err());
+    }
+
+    #[test]
+    fn read_local_auth_file_parses_expected_fields() {
+        let path = write_temp_file(
+            "read-local-auth",
+            r#"{
+                "OPENAI_API_KEY": "sk-local",
+                "tokens": {
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "id_token": "id-token"
+                }
+            }"#,
+        );
+
+        let auth = read_local_auth_file(&path).expect("expected auth file to parse");
+        assert_eq!(auth.openai_api_key.as_deref(), Some("sk-local"));
+        assert_eq!(auth.access_token.as_deref(), Some("access"));
+        assert_eq!(auth.refresh_token.as_deref(), Some("refresh"));
+        assert_eq!(auth.id_token.as_deref(), Some("id-token"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_local_auth_file_rejects_invalid_json_and_root_shape() {
+        let malformed = write_temp_file("malformed-auth", "{");
+        let malformed_err = read_local_auth_file(&malformed).expect_err("expected parse failure");
+        assert!(malformed_err.to_string().contains("failed parsing"));
+        let _ = fs::remove_file(malformed);
+
+        let wrong_root = write_temp_file("wrong-root-auth", "[]");
+        let wrong_root_err =
+            read_local_auth_file(&wrong_root).expect_err("expected object root failure");
+        assert!(wrong_root_err
+            .to_string()
+            .contains("local Codex auth file root must be a JSON object"));
+        let _ = fs::remove_file(wrong_root);
+    }
+
+    #[test]
+    fn update_local_auth_json_preserves_missing_optional_tokens() {
+        let mut auth = LocalCodexAuthData {
+            raw: json!({
+                "tokens": {
+                    "access_token": "old-access",
+                    "refresh_token": "old-refresh",
+                    "id_token": "old-id"
+                }
+            }),
+            openai_api_key: None,
+            access_token: Some("old-access".to_string()),
+            refresh_token: Some("old-refresh".to_string()),
+            id_token: Some("old-id".to_string()),
+        };
+
+        update_local_auth_json(
+            &mut auth,
+            &RefreshTokenResponse {
+                access_token: "new-access".to_string(),
+                refresh_token: None,
+                id_token: None,
+            },
+        )
+        .expect("expected auth JSON update to succeed");
+
+        assert_eq!(auth.access_token.as_deref(), Some("new-access"));
+        assert_eq!(auth.refresh_token.as_deref(), Some("old-refresh"));
+        assert_eq!(auth.id_token.as_deref(), Some("old-id"));
+        assert_eq!(auth.raw["tokens"]["access_token"], "new-access");
+        assert_eq!(auth.raw["tokens"]["refresh_token"], "old-refresh");
+        assert_eq!(auth.raw["tokens"]["id_token"], "old-id");
+    }
+
+    #[test]
+    fn update_local_auth_json_overwrites_optional_tokens_when_present() {
+        let mut auth = LocalCodexAuthData {
+            raw: json!({"tokens": {}}),
+            openai_api_key: None,
+            access_token: None,
+            refresh_token: None,
+            id_token: None,
+        };
+
+        update_local_auth_json(
+            &mut auth,
+            &RefreshTokenResponse {
+                access_token: "new-access".to_string(),
+                refresh_token: Some("new-refresh".to_string()),
+                id_token: Some("new-id".to_string()),
+            },
+        )
+        .expect("expected auth JSON update to succeed");
+
+        assert_eq!(auth.access_token.as_deref(), Some("new-access"));
+        assert_eq!(auth.refresh_token.as_deref(), Some("new-refresh"));
+        assert_eq!(auth.id_token.as_deref(), Some("new-id"));
+        assert_eq!(auth.raw["tokens"]["access_token"], "new-access");
+        assert_eq!(auth.raw["tokens"]["refresh_token"], "new-refresh");
+        assert_eq!(auth.raw["tokens"]["id_token"], "new-id");
+    }
+}

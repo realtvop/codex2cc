@@ -9,7 +9,12 @@ pub fn anthropic_to_openai_request(body: &Value, model_map: &HashMap<String, Str
     let model = body
         .get("model")
         .and_then(Value::as_str)
-        .map(|model| model_map.get(model).cloned().unwrap_or_else(|| model.to_string()))
+        .map(|model| {
+            model_map
+                .get(model)
+                .cloned()
+                .unwrap_or_else(|| model.to_string())
+        })
         .unwrap_or_default();
 
     let mut req = Map::new();
@@ -57,7 +62,10 @@ pub fn anthropic_to_openai_request(body: &Value, model_map: &HashMap<String, Str
 
     if let Some(thinking) = body.get("thinking").and_then(Value::as_object) {
         if thinking.get("type").and_then(Value::as_str) == Some("enabled") {
-            let budget = thinking.get("budget_tokens").and_then(Value::as_i64).unwrap_or(1024);
+            let budget = thinking
+                .get("budget_tokens")
+                .and_then(Value::as_i64)
+                .unwrap_or(1024);
             let effort = if budget >= 8192 {
                 "high"
             } else if budget >= 2048 {
@@ -65,7 +73,10 @@ pub fn anthropic_to_openai_request(body: &Value, model_map: &HashMap<String, Str
             } else {
                 "low"
             };
-            req.insert("reasoning".to_string(), json!({"effort": effort, "summary": "auto"}));
+            req.insert(
+                "reasoning".to_string(),
+                json!({"effort": effort, "summary": "auto"}),
+            );
         }
     }
 
@@ -73,10 +84,20 @@ pub fn anthropic_to_openai_request(body: &Value, model_map: &HashMap<String, Str
     Value::Object(req)
 }
 
-pub fn openai_to_anthropic_response(resp: &Value, request_model: &str, thinking_enabled: bool) -> Value {
+pub fn openai_to_anthropic_response(
+    resp: &Value,
+    request_model: &str,
+    thinking_enabled: bool,
+) -> Value {
     let usage = resp.get("usage").cloned().unwrap_or_else(|| json!({}));
-    let input_tokens = usage.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
-    let output_tokens = usage.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
 
     json!({
         "id": resp.get("id").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("msg_{}", Uuid::new_v4().simple())),
@@ -135,7 +156,11 @@ pub struct StreamConverter {
 }
 
 impl StreamConverter {
-    pub fn new(request_model: String, thinking_enabled: bool, metrics_handle: Option<RequestMetricsHandle>) -> Self {
+    pub fn new(
+        request_model: String,
+        thinking_enabled: bool,
+        metrics_handle: Option<RequestMetricsHandle>,
+    ) -> Self {
         Self {
             request_model,
             thinking_enabled,
@@ -162,15 +187,26 @@ impl StreamConverter {
             "response.output_item.added" => {
                 let item = data.get("item").unwrap_or(&Value::Null);
                 if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                    let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
-                    let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or(&item_id).to_string();
+                    let item_id = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let call_id = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&item_id)
+                        .to_string();
                     let idx = self.block_index;
                     self.active_blocks.insert(item_id.clone(), idx);
-                    self.function_call_buffers.insert(item_id, json!({
-                        "name": item.get("name").and_then(Value::as_str).unwrap_or_default(),
-                        "call_id": call_id,
-                        "arguments": "",
-                    }));
+                    self.function_call_buffers.insert(
+                        item_id,
+                        json!({
+                            "name": item.get("name").and_then(Value::as_str).unwrap_or_default(),
+                            "call_id": call_id,
+                            "arguments": "",
+                        }),
+                    );
                     out.push_str(&self.sse("content_block_start", json!({
                         "type": "content_block_start",
                         "index": idx,
@@ -189,51 +225,85 @@ impl StreamConverter {
                 if part.get("type").and_then(Value::as_str) == Some("output_text") {
                     let key = format!(
                         "text_{}_{}",
-                        data.get("output_index").and_then(Value::as_i64).unwrap_or(0),
-                        data.get("content_index").and_then(Value::as_i64).unwrap_or(0)
+                        data.get("output_index")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0),
+                        data.get("content_index")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0)
                     );
                     let idx = self.block_index;
                     self.active_blocks.insert(key, idx);
-                    out.push_str(&self.sse("content_block_start", json!({
-                        "type": "content_block_start",
-                        "index": idx,
-                        "content_block": {"type": "text", "text": ""},
-                    })));
+                    out.push_str(&self.sse(
+                        "content_block_start",
+                        json!({
+                            "type": "content_block_start",
+                            "index": idx,
+                            "content_block": {"type": "text", "text": ""},
+                        }),
+                    ));
                     self.block_index += 1;
                 }
             }
             "response.output_text.delta" => {
                 let key = format!(
                     "text_{}_{}",
-                    data.get("output_index").and_then(Value::as_i64).unwrap_or(0),
-                    data.get("content_index").and_then(Value::as_i64).unwrap_or(0)
+                    data.get("output_index")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
+                    data.get("content_index")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0)
                 );
-                let delta_text = data.get("delta").and_then(Value::as_str).unwrap_or_default();
+                let delta_text = data
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 self.streamed_output_tokens += 1;
                 let idx = self.active_blocks.get(&key).copied().unwrap_or(0);
-                out.push_str(&self.sse("content_block_delta", json!({
-                    "type": "content_block_delta",
-                    "index": idx,
-                    "delta": {"type": "text_delta", "text": delta_text},
-                })));
+                out.push_str(&self.sse(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {"type": "text_delta", "text": delta_text},
+                    }),
+                ));
             }
             "response.output_text.done" => {
                 let key = format!(
                     "text_{}_{}",
-                    data.get("output_index").and_then(Value::as_i64).unwrap_or(0),
-                    data.get("content_index").and_then(Value::as_i64).unwrap_or(0)
+                    data.get("output_index")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
+                    data.get("content_index")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0)
                 );
                 let idx = self.active_blocks.get(&key).copied().unwrap_or(0);
-                out.push_str(&self.sse("content_block_stop", json!({
-                    "type": "content_block_stop",
-                    "index": idx,
-                })));
+                out.push_str(&self.sse(
+                    "content_block_stop",
+                    json!({
+                        "type": "content_block_stop",
+                        "index": idx,
+                    }),
+                ));
             }
             "response.function_call_arguments.delta" => {
-                let item_id = data.get("item_id").and_then(Value::as_str).unwrap_or_default();
-                let delta = data.get("delta").and_then(Value::as_str).unwrap_or_default();
+                let item_id = data
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let delta = data
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 if let Some(buffer) = self.function_call_buffers.get_mut(item_id) {
-                    let current = buffer.get("arguments").and_then(Value::as_str).unwrap_or_default().to_string();
+                    let current = buffer
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
                     *buffer = json!({
                         "name": buffer.get("name").and_then(Value::as_str).unwrap_or_default(),
                         "call_id": buffer.get("call_id").and_then(Value::as_str).unwrap_or_default(),
@@ -241,36 +311,52 @@ impl StreamConverter {
                     });
                 }
                 let idx = self.active_blocks.get(item_id).copied().unwrap_or(0);
-                out.push_str(&self.sse("content_block_delta", json!({
-                    "type": "content_block_delta",
-                    "index": idx,
-                    "delta": {"type": "input_json_delta", "partial_json": delta},
-                })));
+                out.push_str(&self.sse(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {"type": "input_json_delta", "partial_json": delta},
+                    }),
+                ));
             }
             "response.function_call_arguments.done" => {
-                let item_id = data.get("item_id").and_then(Value::as_str).unwrap_or_default();
+                let item_id = data
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 let idx = self.active_blocks.get(item_id).copied().unwrap_or(0);
-                out.push_str(&self.sse("content_block_stop", json!({
-                    "type": "content_block_stop",
-                    "index": idx,
-                })));
+                out.push_str(&self.sse(
+                    "content_block_stop",
+                    json!({
+                        "type": "content_block_stop",
+                        "index": idx,
+                    }),
+                ));
             }
             "response.reasoning_summary_text.delta" if self.thinking_enabled => {
                 let key = format!(
                     "thinking_{}_{}",
-                    data.get("output_index").and_then(Value::as_i64).unwrap_or(0),
-                    data.get("summary_index").and_then(Value::as_i64).unwrap_or(0)
+                    data.get("output_index")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
+                    data.get("summary_index")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0)
                 );
                 let idx = if let Some(idx) = self.active_blocks.get(&key).copied() {
                     idx
                 } else {
                     let idx = self.block_index;
                     self.active_blocks.insert(key.clone(), idx);
-                    out.push_str(&self.sse("content_block_start", json!({
-                        "type": "content_block_start",
-                        "index": idx,
-                        "content_block": {"type": "thinking", "thinking": ""},
-                    })));
+                    out.push_str(&self.sse(
+                        "content_block_start",
+                        json!({
+                            "type": "content_block_start",
+                            "index": idx,
+                            "content_block": {"type": "thinking", "thinking": ""},
+                        }),
+                    ));
                     self.block_index += 1;
                     idx
                 };
@@ -283,14 +369,21 @@ impl StreamConverter {
             "response.reasoning_summary_text.done" if self.thinking_enabled => {
                 let key = format!(
                     "thinking_{}_{}",
-                    data.get("output_index").and_then(Value::as_i64).unwrap_or(0),
-                    data.get("summary_index").and_then(Value::as_i64).unwrap_or(0)
+                    data.get("output_index")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
+                    data.get("summary_index")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0)
                 );
                 let idx = self.active_blocks.get(&key).copied().unwrap_or(0);
-                out.push_str(&self.sse("content_block_stop", json!({
-                    "type": "content_block_stop",
-                    "index": idx,
-                })));
+                out.push_str(&self.sse(
+                    "content_block_stop",
+                    json!({
+                        "type": "content_block_stop",
+                        "index": idx,
+                    }),
+                ));
             }
             "response.completed" => {
                 let response = data.get("response").unwrap_or(&Value::Null);
@@ -305,7 +398,10 @@ impl StreamConverter {
                     .and_then(Value::as_i64)
                     .unwrap_or(self.streamed_output_tokens);
                 if let Some(metrics_handle) = self.metrics_handle.take() {
-                    metrics_handle.finish(self.input_tokens.max(0) as u64, self.output_tokens.max(0) as u64);
+                    metrics_handle.finish(
+                        self.input_tokens.max(0) as u64,
+                        self.output_tokens.max(0) as u64,
+                    );
                 }
                 out.push_str(&self.sse("message_delta", json!({
                     "type": "message_delta",
@@ -369,7 +465,9 @@ fn convert_messages(messages: Option<&Vec<Value>>) -> Vec<Value> {
 
 fn convert_user_message(content: &Value, items: &mut Vec<Value>) {
     match content {
-        Value::String(text) => items.push(json!({"role": "user", "content": text, "type": "message"})),
+        Value::String(text) => {
+            items.push(json!({"role": "user", "content": text, "type": "message"}))
+        }
         Value::Array(blocks) => {
             let mut regular_blocks = Vec::new();
             for block in blocks {
@@ -382,15 +480,22 @@ fn convert_user_message(content: &Value, items: &mut Vec<Value>) {
                         }));
                         regular_blocks.clear();
                     }
-                    let result_content = if let Some(arr) = block.get("content").and_then(Value::as_array) {
-                        arr.iter()
-                            .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("text"))
-                            .filter_map(|entry| entry.get("text").and_then(Value::as_str))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    } else {
-                        block.get("content").and_then(Value::as_str).unwrap_or_default().to_string()
-                    };
+                    let result_content =
+                        if let Some(arr) = block.get("content").and_then(Value::as_array) {
+                            arr.iter()
+                                .filter(|entry| {
+                                    entry.get("type").and_then(Value::as_str) == Some("text")
+                                })
+                                .filter_map(|entry| entry.get("text").and_then(Value::as_str))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        } else {
+                            block
+                                .get("content")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string()
+                        };
                     items.push(json!({
                         "type": "function_call_output",
                         "call_id": block.get("tool_use_id").and_then(Value::as_str).unwrap_or_default(),
@@ -414,12 +519,20 @@ fn convert_user_message(content: &Value, items: &mut Vec<Value>) {
 
 fn convert_assistant_message(content: &Value, items: &mut Vec<Value>) {
     match content {
-        Value::String(text) => items.push(json!({"role": "assistant", "content": text, "type": "message"})),
+        Value::String(text) => {
+            items.push(json!({"role": "assistant", "content": text, "type": "message"}))
+        }
         Value::Array(blocks) => {
             let mut text_parts = Vec::new();
             for block in blocks {
                 match block.get("type").and_then(Value::as_str) {
-                    Some("text") => text_parts.push(block.get("text").and_then(Value::as_str).unwrap_or_default().to_string()),
+                    Some("text") => text_parts.push(
+                        block
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    ),
                     Some("thinking") => {}
                     Some("tool_use") => {
                         if !text_parts.is_empty() {
@@ -581,5 +694,409 @@ fn determine_stop_reason(resp: &Value) -> &'static str {
 fn copy_key(body: &Value, req: &mut Map<String, Value>, key: &str) {
     if let Some(value) = body.get(key) {
         req.insert(key.to_string(), value.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+
+    fn parse_sse(output: &str) -> Vec<(String, Value)> {
+        output
+            .split("\n\n")
+            .filter(|chunk| !chunk.trim().is_empty())
+            .map(|chunk| {
+                let mut event = None;
+                let mut data = None;
+                for line in chunk.lines() {
+                    if let Some(rest) = line.strip_prefix("event: ") {
+                        event = Some(rest.to_string());
+                    } else if let Some(rest) = line.strip_prefix("data: ") {
+                        data = Some(serde_json::from_str(rest).expect("valid SSE JSON"));
+                    }
+                }
+                (
+                    event.expect("missing SSE event name"),
+                    data.expect("missing SSE data"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn anthropic_request_maps_core_fields_and_messages() {
+        let model_map = HashMap::from([("claude-3-7-sonnet".to_string(), "gpt-5".to_string())]);
+        let body = json!({
+            "model": "claude-3-7-sonnet",
+            "system": [
+                {"text": "system line 1"},
+                {"text": "system line 2"}
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "hello"},
+                        {"type": "image", "source": {"type": "url", "url": "https://example.com/image.png"}},
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_1",
+                            "content": [
+                                {"type": "text", "text": "tool line 1"},
+                                {"type": "text", "text": "tool line 2"}
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "visible reply"},
+                        {"type": "thinking", "thinking": "hidden reasoning"},
+                        {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {"city": "Paris"}}
+                    ]
+                }
+            ],
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "stream": true,
+            "max_tokens": 123,
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "lookup",
+                    "description": "Look up a city",
+                    "input_schema": {"type": "object"}
+                },
+                {
+                    "type": "computer",
+                    "name": "ignored"
+                }
+            ],
+            "tool_choice": {"type": "tool", "name": "lookup"}
+        });
+
+        let request = anthropic_to_openai_request(&body, &model_map);
+        let input = request["input"].as_array().expect("input array");
+
+        assert_eq!(request["model"], "gpt-5");
+        assert_eq!(request["instructions"], "system line 1\nsystem line 2");
+        assert_eq!(request["temperature"], json!(0.2));
+        assert_eq!(request["top_p"], json!(0.9));
+        assert_eq!(request["stream"], json!(true));
+        assert_eq!(request["max_output_tokens"], json!(123));
+        assert_eq!(request["store"], json!(false));
+        assert_eq!(
+            request["tools"],
+            json!([{
+                "type": "function",
+                "name": "lookup",
+                "description": "Look up a city",
+                "parameters": {"type": "object"},
+                "strict": false
+            }])
+        );
+        assert_eq!(
+            request["tool_choice"],
+            json!({"type": "function", "name": "lookup"})
+        );
+
+        assert_eq!(
+            input[0],
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "hello"},
+                    {"type": "input_image", "image_url": "https://example.com/image.png"}
+                ],
+                "type": "message"
+            })
+        );
+        assert_eq!(
+            input[1],
+            json!({
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "tool line 1\ntool line 2"
+            })
+        );
+        assert_eq!(
+            input[2],
+            json!({
+                "role": "assistant",
+                "content": "visible reply",
+                "type": "message"
+            })
+        );
+        assert_eq!(
+            input[3],
+            json!({
+                "type": "function_call",
+                "id": "fc_call_1",
+                "call_id": "call_1",
+                "name": "lookup",
+                "arguments": "{\"city\":\"Paris\"}"
+            })
+        );
+    }
+
+    #[test]
+    fn anthropic_request_maps_reasoning_effort_and_tool_choice_shortcuts() {
+        let model_map = HashMap::new();
+
+        for (budget, expected_effort) in [(1024, "low"), (2048, "medium"), (8192, "high")] {
+            let body = json!({
+                "model": "claude",
+                "system": "system text",
+                "messages": [],
+                "thinking": {"type": "enabled", "budget_tokens": budget},
+                "tool_choice": {"type": "auto"}
+            });
+
+            let request = anthropic_to_openai_request(&body, &model_map);
+            assert_eq!(request["instructions"], "system text");
+            assert_eq!(
+                request["reasoning"],
+                json!({"effort": expected_effort, "summary": "auto"})
+            );
+            assert_eq!(request["tool_choice"], json!("auto"));
+        }
+
+        let required = anthropic_to_openai_request(
+            &json!({"messages": [], "tool_choice": {"type": "any"}}),
+            &model_map,
+        );
+        assert_eq!(required["tool_choice"], json!("required"));
+
+        let none = anthropic_to_openai_request(
+            &json!({"messages": [], "tool_choice": {"type": "none"}}),
+            &model_map,
+        );
+        assert_eq!(none["tool_choice"], json!("none"));
+    }
+
+    #[test]
+    fn openai_response_converts_content_blocks_and_usage() {
+        let response = json!({
+            "id": "resp_123",
+            "status": "completed",
+            "usage": {"input_tokens": 11, "output_tokens": 7},
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "hello"},
+                        {"type": "refusal", "refusal": "nope"}
+                    ]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "{\"city\":\"Paris\"}"
+                },
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "reasoning summary"}]
+                }
+            ]
+        });
+
+        let anthropic = openai_to_anthropic_response(&response, "claude-3", true);
+
+        assert_eq!(anthropic["id"], "resp_123");
+        assert_eq!(anthropic["model"], "claude-3");
+        assert_eq!(anthropic["stop_reason"], "tool_use");
+        assert_eq!(anthropic["usage"]["input_tokens"], json!(11));
+        assert_eq!(anthropic["usage"]["output_tokens"], json!(7));
+        assert_eq!(
+            anthropic["content"],
+            json!([
+                {"type": "text", "text": "hello"},
+                {"type": "text", "text": "[Refused]: nope"},
+                {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {"city": "Paris"}},
+                {"type": "thinking", "thinking": "reasoning summary", "signature": ""}
+            ])
+        );
+    }
+
+    #[test]
+    fn openai_response_omits_thinking_when_disabled_and_detects_incomplete_stop_reason() {
+        let response = json!({
+            "status": "incomplete",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "reasoning summary"}]
+                },
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "hello"}]
+                }
+            ]
+        });
+
+        let anthropic = openai_to_anthropic_response(&response, "claude-3", false);
+
+        assert_eq!(anthropic["stop_reason"], "max_tokens");
+        assert_eq!(
+            anthropic["content"],
+            json!([{"type": "text", "text": "hello"}])
+        );
+        assert_eq!(determine_stop_reason(&json!({})), "end_turn");
+    }
+
+    #[test]
+    fn build_error_data_maps_status_codes_and_messages() {
+        let auth_error = build_error_data(401, &json!({"error": {"message": "bad key"}}));
+        assert_eq!(auth_error["error"]["type"], "authentication_error");
+        assert_eq!(auth_error["error"]["message"], "bad key");
+
+        let api_error = build_error_data(502, &json!({"message": "upstream exploded"}));
+        assert_eq!(api_error["error"]["type"], "api_error");
+        assert_eq!(api_error["error"]["message"], "upstream exploded");
+    }
+
+    #[test]
+    fn stream_converter_emits_message_start_once_and_text_events() {
+        let mut converter = StreamConverter::new("claude-3".to_string(), false, None);
+
+        let first = parse_sse(&converter.process_event("response.created", &json!({})));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, "message_start");
+        assert_eq!(first[0].1["message"]["model"], "claude-3");
+
+        assert!(converter
+            .process_event("response.in_progress", &json!({}))
+            .is_empty());
+
+        let start = parse_sse(&converter.process_event(
+            "response.content_part.added",
+            &json!({
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text"}
+            }),
+        ));
+        assert_eq!(start[0].0, "content_block_start");
+        assert_eq!(start[0].1["index"], json!(0));
+        assert_eq!(start[0].1["content_block"]["type"], "text");
+
+        let delta = parse_sse(&converter.process_event(
+            "response.output_text.delta",
+            &json!({
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "Hello"
+            }),
+        ));
+        assert_eq!(delta[0].0, "content_block_delta");
+        assert_eq!(delta[0].1["delta"]["type"], "text_delta");
+        assert_eq!(delta[0].1["delta"]["text"], "Hello");
+
+        let stop = parse_sse(&converter.process_event(
+            "response.output_text.done",
+            &json!({
+                "output_index": 0,
+                "content_index": 0
+            }),
+        ));
+        assert_eq!(stop[0].0, "content_block_stop");
+        assert_eq!(stop[0].1["index"], json!(0));
+    }
+
+    #[test]
+    fn stream_converter_emits_function_call_reasoning_and_completion_events() {
+        let mut converter = StreamConverter::new("claude-3".to_string(), true, None);
+
+        let tool_start = parse_sse(&converter.process_event(
+            "response.output_item.added",
+            &json!({
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "lookup"
+                }
+            }),
+        ));
+        assert_eq!(tool_start[0].0, "content_block_start");
+        assert_eq!(tool_start[0].1["content_block"]["type"], "tool_use");
+        assert_eq!(tool_start[0].1["content_block"]["id"], "call_1");
+
+        let tool_delta = parse_sse(&converter.process_event(
+            "response.function_call_arguments.delta",
+            &json!({
+                "item_id": "fc_1",
+                "delta": "{\"city\":\"Paris\"}"
+            }),
+        ));
+        assert_eq!(tool_delta[0].0, "content_block_delta");
+        assert_eq!(tool_delta[0].1["delta"]["type"], "input_json_delta");
+        assert_eq!(
+            tool_delta[0].1["delta"]["partial_json"],
+            "{\"city\":\"Paris\"}"
+        );
+
+        let tool_stop = parse_sse(&converter.process_event(
+            "response.function_call_arguments.done",
+            &json!({"item_id": "fc_1"}),
+        ));
+        assert_eq!(tool_stop[0].0, "content_block_stop");
+
+        let thinking_delta = parse_sse(&converter.process_event(
+            "response.reasoning_summary_text.delta",
+            &json!({
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": "thinking..."
+            }),
+        ));
+        assert_eq!(thinking_delta.len(), 2);
+        assert_eq!(thinking_delta[0].0, "content_block_start");
+        assert_eq!(thinking_delta[0].1["content_block"]["type"], "thinking");
+        assert_eq!(thinking_delta[1].0, "content_block_delta");
+        assert_eq!(thinking_delta[1].1["delta"]["type"], "thinking_delta");
+        assert_eq!(thinking_delta[1].1["delta"]["thinking"], "thinking...");
+
+        let thinking_stop = parse_sse(&converter.process_event(
+            "response.reasoning_summary_text.done",
+            &json!({
+                "output_index": 0,
+                "summary_index": 0
+            }),
+        ));
+        assert_eq!(thinking_stop[0].0, "content_block_stop");
+
+        let completed = parse_sse(&converter.process_event(
+            "response.completed",
+            &json!({
+                "response": {
+                    "usage": {"input_tokens": 5, "output_tokens": 3}
+                }
+            }),
+        ));
+        assert_eq!(completed.len(), 2);
+        assert_eq!(completed[0].0, "message_delta");
+        assert_eq!(completed[0].1["usage"]["output_tokens"], json!(3));
+        assert_eq!(completed[0].1["delta"]["stop_reason"], "end_turn");
+        assert_eq!(completed[1].0, "message_stop");
+    }
+
+    #[test]
+    fn stream_converter_suppresses_reasoning_events_when_disabled() {
+        let mut converter = StreamConverter::new("claude-3".to_string(), false, None);
+        assert!(converter
+            .process_event(
+                "response.reasoning_summary_text.delta",
+                &json!({
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "delta": "hidden"
+                }),
+            )
+            .is_empty());
     }
 }
