@@ -1,6 +1,7 @@
 mod config;
 mod converter;
 mod metrics;
+mod upstream_auth;
 
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
@@ -14,19 +15,23 @@ use axum::{
 };
 use bytes::Bytes;
 use config::AppConfig;
-use converter::{anthropic_to_openai_request, build_error_data, openai_to_anthropic_response, StreamConverter};
-use metrics::{MetricsRegistry, RequestMetricsHandle};
+use converter::{
+    anthropic_to_openai_request, build_error_data, openai_to_anthropic_response, StreamConverter,
+};
 use futures::{stream, StreamExt, TryStreamExt};
+use metrics::{MetricsRegistry, RequestMetricsHandle};
 use reqwest::Client;
 use serde_json::{json, Value};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
+use upstream_auth::{CredentialSource, ResolvedCredential, UpstreamAuthManager};
 
 #[derive(Clone)]
 struct AppState {
     config: Arc<AppConfig>,
     client: Client,
     metrics: Arc<MetricsRegistry>,
+    upstream_auth: Arc<UpstreamAuthManager>,
 }
 
 #[tokio::main]
@@ -34,29 +39,52 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let config = Arc::new(AppConfig::load()?);
-    let client = Client::builder().timeout(Duration::from_secs(600)).build()?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()?;
     let metrics = MetricsRegistry::new();
+    let upstream_auth = UpstreamAuthManager::new(config.upstream.clone(), client.clone());
 
-    info!(host = %config.server.host, port = config.server.port, upstream = %config.upstream.base_url, auth_enabled = config.auth_enabled(), "starting Rust proxy server");
+    info!(
+        host = %config.server.host,
+        port = config.server.port,
+        upstream = %config.upstream.base_url,
+        auth_enabled = config.auth_enabled(),
+        prefer_local_codex_credentials = config.upstream.prefer_local_codex_credentials,
+        "starting Rust proxy server"
+    );
 
     let bind_host: std::net::IpAddr = config.server.host.parse()?;
     let bind_port = config.server.port;
 
-    let app = Router::new()
-        .route("/v1/messages", post(create_message))
-        .route("/v1/messages/count_tokens", post(count_tokens))
-        .layer(TraceLayer::new_for_http())
-        .with_state(AppState { config, client, metrics });
-
+    let state = AppState {
+        config,
+        client,
+        metrics,
+        upstream_auth,
+    };
     let listener = tokio::net::TcpListener::bind((bind_host, bind_port)).await?;
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, build_app(state)).await?;
     Ok(())
 }
 
+fn build_app(state: AppState) -> Router {
+    Router::new()
+        .route("/v1/messages", post(create_message))
+        .route("/v1/messages/count_tokens", post(count_tokens))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
 fn init_tracing() {
-    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "codextocc=info,tower_http=warn".to_string());
-    tracing_subscriber::fmt().with_env_filter(filter).with_target(false).compact().init();
+    let filter =
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "codextocc=info,tower_http=warn".to_string());
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .compact()
+        .init();
 }
 
 async fn create_message(
@@ -68,7 +96,11 @@ async fn create_message(
         return resp;
     }
 
-    let request_model = body.get("model").and_then(Value::as_str).unwrap_or_default().to_string();
+    let request_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let thinking_enabled = body
         .get("thinking")
         .and_then(Value::as_object)
@@ -84,21 +116,29 @@ async fn create_message(
     let openai_body = anthropic_to_openai_request(&body, &state.config.model_map);
 
     if is_stream {
-        return stream_response(state, openai_body, request_model, thinking_enabled, metrics_handle).await.into_response();
+        return stream_response(
+            state,
+            openai_body,
+            request_model,
+            thinking_enabled,
+            metrics_handle,
+        )
+        .await
+        .into_response();
     }
 
-    let url = format!("{}/responses", state.config.upstream.base_url);
-    let request_builder = state.client.post(&url).headers(upstream_headers(&state.config)).json(&openai_body);
-
-    let resp = match request_builder.send().await {
+    let resp = match execute_upstream_request(&state, "/responses", &openai_body, None).await {
         Ok(resp) => resp,
         Err(err) => {
             metrics_handle.fail();
             error!(request_id = metrics_handle.id(), error = %err, "upstream request failed");
-            return error_response(StatusCode::BAD_GATEWAY, json!({
-                "type": "error",
-                "error": {"type": "api_error", "message": err.to_string()}
-            }));
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                json!({
+                    "type": "error",
+                    "error": {"type": "api_error", "message": err.to_string()}
+                }),
+            );
         }
     };
 
@@ -108,16 +148,20 @@ async fn create_message(
         Err(err) => {
             metrics_handle.fail();
             error!(request_id = metrics_handle.id(), error = %err, "failed reading upstream response body");
-            return error_response(StatusCode::BAD_GATEWAY, json!({
-                "type": "error",
-                "error": {"type": "api_error", "message": err.to_string()}
-            }));
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                json!({
+                    "type": "error",
+                    "error": {"type": "api_error", "message": err.to_string()}
+                }),
+            );
         }
     };
 
     if !status.is_success() {
         metrics_handle.fail();
-        let upstream_json = serde_json::from_str::<Value>(&response_text).unwrap_or_else(|_| json!({"error": {"message": response_text}}));
+        let upstream_json = serde_json::from_str::<Value>(&response_text)
+            .unwrap_or_else(|_| json!({"error": {"message": response_text}}));
         return error_response(status, build_error_data(status.as_u16(), &upstream_json));
     }
 
@@ -126,10 +170,13 @@ async fn create_message(
         Err(err) => {
             metrics_handle.fail();
             error!(request_id = metrics_handle.id(), error = %err, "failed to parse upstream JSON response");
-            return error_response(StatusCode::BAD_GATEWAY, json!({
-                "type": "error",
-                "error": {"type": "api_error", "message": err.to_string()}
-            }));
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                json!({
+                    "type": "error",
+                    "error": {"type": "api_error", "message": err.to_string()}
+                }),
+            );
         }
     };
 
@@ -145,7 +192,8 @@ async fn create_message(
         .unwrap_or(0);
     metrics_handle.finish(input_tokens, output_tokens);
 
-    let anthropic_resp = openai_to_anthropic_response(&openai_resp, &request_model, thinking_enabled);
+    let anthropic_resp =
+        openai_to_anthropic_response(&openai_resp, &request_model, thinking_enabled);
     info!(model = %request_model, "finished /v1/messages request");
 
     let mut response = Json(anthropic_resp).into_response();
@@ -164,16 +212,7 @@ async fn stream_response(
     thinking_enabled: bool,
     metrics_handle: RequestMetricsHandle,
 ) -> Response<Body> {
-    let url = format!("{}/responses", state.config.upstream.base_url);
-
-    let resp = match state
-        .client
-        .post(&url)
-        .headers(upstream_headers(&state.config))
-        .json(&openai_body)
-        .send()
-        .await
-    {
+    let resp = match execute_upstream_request(&state, "/responses", &openai_body, None).await {
         Ok(resp) => resp,
         Err(err) => {
             metrics_handle.fail();
@@ -189,12 +228,22 @@ async fn stream_response(
     if !status.is_success() {
         metrics_handle.fail();
         let text = resp.text().await.unwrap_or_default();
-        warn!(request_id = metrics_handle.id(), status = %status, body = %truncate_str(&text), "upstream SSE request returned error");
-        let upstream_json = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({"error": {"message": text}}));
+        warn!(
+            request_id = metrics_handle.id(),
+            status = %status,
+            body = %truncate_str(&text),
+            "upstream SSE request returned error"
+        );
+        let upstream_json = serde_json::from_str::<Value>(&text)
+            .unwrap_or_else(|_| json!({"error": {"message": text}}));
         return sse_error_response(build_error_data(status.as_u16(), &upstream_json));
     }
 
-    let mut converter = StreamConverter::new(request_model.clone(), thinking_enabled, Some(metrics_handle.clone()));
+    let mut converter = StreamConverter::new(
+        request_model.clone(),
+        thinking_enabled,
+        Some(metrics_handle.clone()),
+    );
     let mut event_type = String::new();
     let mut data_buf = String::new();
     let stream_metrics_handle = metrics_handle.clone();
@@ -232,19 +281,26 @@ async fn stream_response(
                         }
                     }
                 }
-                Err(_) => {
-                    outputs.push(Ok(Bytes::from_static(b"")));
-                }
+                Err(_) => outputs.push(Ok(Bytes::from_static(b""))),
             }
             stream::iter(outputs)
         });
 
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert("content-type", HeaderValue::from_static("text/event-stream"));
-    response.headers_mut().insert("cache-control", HeaderValue::from_static("no-cache"));
-    response.headers_mut().insert("connection", HeaderValue::from_static("keep-alive"));
-    response.headers_mut().insert("x-accel-buffering", HeaderValue::from_static("no"));
+    response.headers_mut().insert(
+        "content-type",
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
+        .headers_mut()
+        .insert("cache-control", HeaderValue::from_static("no-cache"));
+    response
+        .headers_mut()
+        .insert("connection", HeaderValue::from_static("keep-alive"));
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
     response
 }
 
@@ -260,16 +316,13 @@ async fn count_tokens(
     info!("started /v1/messages/count_tokens request");
 
     let openai_body = anthropic_to_openai_request(&body, &state.config.model_map);
-
-    let url = format!("{}/responses/input_tokens", state.config.upstream.base_url);
-    let resp = state
-        .client
-        .post(&url)
-        .headers(upstream_headers(&state.config))
-        .json(&openai_body)
-        .timeout(Duration::from_secs(30))
-        .send()
-        .await;
+    let resp = execute_upstream_request(
+        &state,
+        "/responses/input_tokens",
+        &openai_body,
+        Some(Duration::from_secs(30)),
+    )
+    .await;
 
     match resp {
         Ok(resp) if resp.status().is_success() => {
@@ -289,18 +342,99 @@ async fn count_tokens(
         Ok(resp) => {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            warn!(status = %status, body = %truncate_str(&text), "upstream input_tokens request failed; using fallback");
+            warn!(
+                status = %status,
+                body = %truncate_str(&text),
+                "upstream input_tokens request failed; using fallback"
+            );
             let estimated = estimate_tokens_from_body(&body);
-            info!(estimated, "count-tokens fallback used after upstream non-success status");
+            info!(
+                estimated,
+                "count-tokens fallback used after upstream non-success status"
+            );
             Json(json!({"input_tokens": estimated})).into_response()
         }
         Err(err) => {
             warn!(error = %err, "upstream input_tokens request errored; using fallback");
             let estimated = estimate_tokens_from_body(&body);
-            info!(estimated, "count-tokens fallback used after upstream request error");
+            info!(
+                estimated,
+                "count-tokens fallback used after upstream request error"
+            );
             Json(json!({"input_tokens": estimated})).into_response()
         }
     }
+}
+
+async fn execute_upstream_request(
+    state: &AppState,
+    endpoint: &str,
+    body: &Value,
+    timeout: Option<Duration>,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let url = join_upstream_url(&state.config.upstream.base_url, endpoint);
+    let mut credential = state.upstream_auth.resolve_primary().await;
+    let mut response =
+        send_upstream_request(&state.client, &url, body, timeout, &credential).await?;
+
+    if is_auth_error(response.status())
+        && credential.source == CredentialSource::LocalCodexAccessToken
+    {
+        if let Some(refreshed) = state.upstream_auth.resolve_after_token_unauthorized().await {
+            info!("retrying upstream request with refreshed local Codex access token");
+            response =
+                send_upstream_request(&state.client, &url, body, timeout, &refreshed).await?;
+            credential = refreshed;
+        }
+    }
+
+    if is_auth_error(response.status()) && credential.source.is_local() {
+        if let Some(configured) = state.upstream_auth.configured_api_key_fallback(&credential) {
+            info!("retrying upstream request with configured API key fallback");
+            response =
+                send_upstream_request(&state.client, &url, body, timeout, &configured).await?;
+        }
+    }
+
+    Ok(response)
+}
+
+async fn send_upstream_request(
+    client: &Client,
+    url: &str,
+    body: &Value,
+    timeout: Option<Duration>,
+    credential: &ResolvedCredential,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut request = client
+        .post(url)
+        .headers(upstream_headers(credential))
+        .json(body);
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
+    request.send().await
+}
+
+fn upstream_headers(credential: &ResolvedCredential) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let bearer = format!("Bearer {}", credential.token);
+    headers.insert(
+        "authorization",
+        HeaderValue::from_str(&bearer).unwrap_or_else(|_| HeaderValue::from_static("Bearer ")),
+    );
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    headers
+}
+
+fn join_upstream_url(base_url: &str, endpoint: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let suffix = endpoint.trim_start_matches('/');
+    format!("{base}/{suffix}")
+}
+
+fn is_auth_error(status: StatusCode) -> bool {
+    status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN
 }
 
 fn check_auth(config: &AppConfig, headers: &HeaderMap) -> Option<Response<Body>> {
@@ -340,14 +474,6 @@ fn get_client_key(headers: &HeaderMap) -> String {
     String::new()
 }
 
-fn upstream_headers(config: &AppConfig) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    let bearer = format!("Bearer {}", config.upstream.api_key);
-    headers.insert("authorization", HeaderValue::from_str(&bearer).unwrap_or_else(|_| HeaderValue::from_static("Bearer ")));
-    headers.insert("content-type", HeaderValue::from_static("application/json"));
-    headers
-}
-
 fn error_response(status: StatusCode, body: Value) -> Response<Body> {
     let mut response = Json(body).into_response();
     *response.status_mut() = status;
@@ -358,7 +484,10 @@ fn sse_error_response(body: Value) -> Response<Body> {
     let payload = format!("event: error\ndata: {}\n\n", body);
     let mut response = Response::new(Body::from(payload));
     *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert("content-type", HeaderValue::from_static("text/event-stream"));
+    response.headers_mut().insert(
+        "content-type",
+        HeaderValue::from_static("text/event-stream"),
+    );
     response
 }
 
@@ -410,6 +539,10 @@ fn truncate_str(value: &str) -> String {
     if value.len() <= LIMIT {
         value.to_string()
     } else {
-        format!("{}...<truncated {} chars>", &value[..LIMIT], value.len() - LIMIT)
+        format!(
+            "{}...<truncated {} chars>",
+            &value[..LIMIT],
+            value.len() - LIMIT
+        )
     }
 }
