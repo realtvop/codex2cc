@@ -3,7 +3,12 @@ mod converter;
 mod metrics;
 mod upstream_auth;
 
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     body::Body,
@@ -20,7 +25,7 @@ use converter::{
 };
 use futures::{stream, StreamExt, TryStreamExt};
 use metrics::{MetricsRegistry, RequestMetricsHandle};
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde_json::{json, Value};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
@@ -68,7 +73,16 @@ async fn main() -> anyhow::Result<()> {
         "starting Rust proxy server"
     );
 
-    let bind_host: std::net::IpAddr = config.server.host.parse()?;
+    let cc_switch_deeplink = build_cc_switch_import_deeplink_for_log(&config);
+    info!(
+        deep_link = %cc_switch_deeplink,
+        "CC Switch import deep link"
+    );
+    if config.api_keys.is_empty() {
+        warn!("CC Switch import deep link generated without apiKey because client auth is disabled");
+    }
+
+    let bind_host: IpAddr = config.server.host.parse()?;
     let bind_port = config.server.port;
 
     let state = AppState {
@@ -561,6 +575,64 @@ fn sse_error_response(body: Value) -> Response<Body> {
     response
 }
 
+fn build_cc_switch_import_deeplink_for_log(config: &AppConfig) -> String {
+    let mut url = Url::parse("ccswitch://v1/import").expect("cc switch import url should be valid");
+    let endpoint = build_cc_switch_endpoint(&config.server.host, config.server.port);
+
+    let mut query = url.query_pairs_mut();
+    query.append_pair("resource", "provider");
+    query.append_pair("app", "claude");
+    query.append_pair("name", "codextocc");
+    query.append_pair("endpoint", &endpoint);
+
+    if let Some(api_key) = sorted_first_api_key(config) {
+        query.append_pair("apiKey", &mask_api_key(api_key));
+    }
+
+    drop(query);
+    url.into()
+}
+
+fn build_cc_switch_endpoint(host: &str, port: u16) -> String {
+    let normalized_host = normalize_endpoint_host(host);
+    if let Ok(ip) = normalized_host.parse::<IpAddr>() {
+        SocketAddr::new(ip, port).to_string()
+    } else {
+        format!("{normalized_host}:{port}")
+    }
+}
+
+fn normalize_endpoint_host(host: &str) -> String {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if ip.is_unspecified() {
+            return Ipv4Addr::LOCALHOST.to_string();
+        }
+        return ip.to_string();
+    }
+
+    host.to_string()
+}
+
+fn sorted_first_api_key(config: &AppConfig) -> Option<&str> {
+    let mut keys: Vec<&str> = config.api_keys.iter().map(String::as_str).collect();
+    keys.sort_unstable();
+    keys.first().copied()
+}
+
+fn mask_api_key(api_key: &str) -> String {
+    let char_count = api_key.chars().count();
+    if char_count <= 8 {
+        return "****".to_string();
+    }
+
+    let prefix: String = api_key.chars().take(4).collect();
+    let suffix: String = api_key
+        .chars()
+        .skip(char_count.saturating_sub(4))
+        .collect();
+    format!("{prefix}...{suffix}")
+}
+
 fn estimate_tokens_from_body(body: &Value) -> i64 {
     let mut total_chars = 0usize;
 
@@ -642,6 +714,86 @@ mod tests {
             },
             model_map: HashMap::new(),
         }
+    }
+
+    fn query_map(url: &str) -> HashMap<String, String> {
+        Url::parse(url)
+            .expect("deep link should be valid url")
+            .query_pairs()
+            .into_owned()
+            .collect()
+    }
+
+    #[test]
+    fn cc_switch_deeplink_has_expected_structure_and_required_params() {
+        let config = sample_config(&["zzzzzzzz", "aaaaBBBBcccc"]);
+        let deeplink = build_cc_switch_import_deeplink_for_log(&config);
+        let parsed = Url::parse(&deeplink).expect("deep link should parse");
+        let query = query_map(&deeplink);
+
+        assert_eq!(parsed.scheme(), "ccswitch");
+        assert_eq!(parsed.host_str(), Some("v1"));
+        assert_eq!(parsed.path(), "/import");
+
+        assert_eq!(query.get("resource").map(String::as_str), Some("provider"));
+        assert_eq!(query.get("app").map(String::as_str), Some("claude"));
+        assert_eq!(query.get("name").map(String::as_str), Some("codextocc"));
+        assert_eq!(
+            query.get("endpoint").map(String::as_str),
+            Some("127.0.0.1:8082")
+        );
+        assert_eq!(query.get("apiKey").map(String::as_str), Some("aaaa...cccc"));
+    }
+
+    #[test]
+    fn cc_switch_deeplink_url_encodes_special_characters() {
+        let config = sample_config(&["a&? zzzzYYYY"]);
+        let deeplink = build_cc_switch_import_deeplink_for_log(&config);
+
+        assert!(deeplink.contains("apiKey=a%26%3F+...YYYY"));
+
+        let query = query_map(&deeplink);
+        assert_eq!(query.get("apiKey").map(String::as_str), Some("a&? ...YYYY"));
+    }
+
+    #[test]
+    fn cc_switch_deeplink_masks_api_key_and_never_logs_plaintext() {
+        let plain = "secret-token-1234";
+        let config = sample_config(&[plain]);
+        let deeplink = build_cc_switch_import_deeplink_for_log(&config);
+
+        assert!(!deeplink.contains(plain));
+        assert!(deeplink.contains("apiKey=secr...1234"));
+    }
+
+    #[test]
+    fn cc_switch_deeplink_falls_back_unspecified_hosts_to_localhost() {
+        let mut ipv4_config = sample_config(&["secrettoken"]);
+        ipv4_config.server.host = "0.0.0.0".to_string();
+
+        let mut ipv6_config = sample_config(&["secrettoken"]);
+        ipv6_config.server.host = "::".to_string();
+
+        let ipv4_query = query_map(&build_cc_switch_import_deeplink_for_log(&ipv4_config));
+        let ipv6_query = query_map(&build_cc_switch_import_deeplink_for_log(&ipv6_config));
+
+        assert_eq!(
+            ipv4_query.get("endpoint").map(String::as_str),
+            Some("127.0.0.1:8082")
+        );
+        assert_eq!(
+            ipv6_query.get("endpoint").map(String::as_str),
+            Some("127.0.0.1:8082")
+        );
+    }
+
+    #[test]
+    fn cc_switch_deeplink_omits_api_key_when_auth_is_disabled() {
+        let config = sample_config(&[]);
+        let deeplink = build_cc_switch_import_deeplink_for_log(&config);
+        let query = query_map(&deeplink);
+
+        assert!(!query.contains_key("apiKey"));
     }
 
     #[test]
