@@ -8,16 +8,40 @@ api_keys:
 upstream:
   base_url: "https://api.openai.com/v1"
   api_key: ""
+  # local_codex | config_api_key | account_pool
+  auth_mode: "local_codex"
   prefer_local_codex_credentials: true
   local_codex_auth_path: "~/.codex/auth.json"
   refresh_local_codex_tokens: true
+  # Used when local_codex or account_pool credentials target Codex endpoints
+  codex_base_url: "https://chatgpt.com/backend-api/codex"
+
+  account_pool:
+    store_path: "~/.codextocc/account-pool.json"
+    quota_refresh_interval_secs: 30
+    quota_headers:
+      remaining: "x-ratelimit-remaining-requests"
+      reset: "x-ratelimit-reset-requests"
+    oauth:
+      # Required when running `pool login`
+      client_id: ""
+      scopes:
+        - "openid"
+        - "profile"
+        - "email"
+        - "offline_access"
+    openid_config_url: "https://auth.openai.com/.well-known/openid-configuration"
+    # Optional overrides (if omitted, discovered from openid_config_url)
+    oauth_token_endpoint: ""
+    oauth_device_authorization_endpoint: ""
 
 model_map: {}
 
-# Optional fallback API key if local Codex credentials are unavailable:
+# Optional fallback API key if local Codex credentials are unavailable (legacy mode):
 # upstream:
 #   base_url: "https://api.openai.com/v1"
 #   api_key: "configured-openai-api-key"
+#   auth_mode: "local_codex"
 #   prefer_local_codex_credentials: true
 #   local_codex_auth_path: "~/.codex/auth.json"
 #   refresh_local_codex_tokens: true
@@ -25,3 +49,17 @@ model_map: {}
 #   local_codex_oauth_client_id: ""
 #   # Optional override to bypass discovery
 #   local_codex_oauth_token_endpoint: ""
+
+# Account pool mode example (fully decoupled from ~/.codex/auth.json):
+# upstream:
+#   auth_mode: "account_pool"
+#   base_url: "https://api.openai.com/v1"
+#   codex_base_url: "https://chatgpt.com/backend-api/codex"
+#   account_pool:
+#     store_path: "~/.codextocc/account-pool.json"
+#     quota_refresh_interval_secs: 30
+#     quota_headers:
+#       remaining: "x-ratelimit-remaining-requests"
+#       reset: "x-ratelimit-reset-requests"
+#     oauth:
+#       client_id: "your-oauth-client-id"

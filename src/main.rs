@@ -1,15 +1,18 @@
+mod account_pool;
 mod config;
 mod converter;
 mod metrics;
 mod upstream_auth;
 
 use std::{
+    collections::HashSet,
     convert::Infallible,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
+use account_pool::{format_reset_time_iso, AccountPoolManager, AccountSelection};
 use axum::{
     body::Body,
     extract::State,
@@ -19,7 +22,7 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
-use config::{AppConfig, ConfigLoad, DEFAULT_CODEX_BASE_URL};
+use config::{AppConfig, AuthMode, ConfigLoad, DEFAULT_CODEX_BASE_URL};
 use converter::{
     anthropic_to_openai_request, build_error_data, openai_to_anthropic_response, StreamConverter,
 };
@@ -37,11 +40,33 @@ struct AppState {
     client: Client,
     metrics: Arc<MetricsRegistry>,
     upstream_auth: Arc<UpstreamAuthManager>,
+    account_pool: Arc<AccountPoolManager>,
+}
+
+enum CliCommand {
+    Serve,
+    Pool(PoolCommand),
+}
+
+enum PoolCommand {
+    Login { alias: Option<String> },
+    List,
+    Enable { account: String },
+    Disable { account: String },
+    Remove { account: String },
+    Refresh,
+}
+
+enum UpstreamRequestError {
+    Request(reqwest::Error),
+    AccountPoolExhausted { reset_at: Option<SystemTime> },
+    Internal(anyhow::Error),
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
+    let command = parse_cli_command()?;
 
     let config = match AppConfig::load()? {
         ConfigLoad::Loaded(config) => Arc::new(config),
@@ -58,6 +83,16 @@ async fn main() -> anyhow::Result<()> {
         .build()?;
     let metrics = MetricsRegistry::new();
     let upstream_auth = UpstreamAuthManager::new(config.upstream.clone(), client.clone());
+    let account_pool = AccountPoolManager::new(
+        config.upstream.account_pool.clone(),
+        config.upstream.codex_base_url.clone(),
+        client.clone(),
+    );
+
+    if let CliCommand::Pool(pool_command) = command {
+        run_pool_command(&account_pool, pool_command).await?;
+        return Ok(());
+    }
 
     info!(
         host = %config.server.host,
@@ -68,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
             .codex_base_url
             .as_deref()
             .unwrap_or(DEFAULT_CODEX_BASE_URL),
+        auth_mode = config.upstream.auth_mode.as_str(),
         auth_enabled = config.auth_enabled(),
         prefer_local_codex_credentials = config.upstream.prefer_local_codex_credentials,
         "starting Rust proxy server"
@@ -79,21 +115,160 @@ async fn main() -> anyhow::Result<()> {
         "CC Switch import deep link"
     );
     if config.api_keys.is_empty() {
-        warn!("CC Switch import deep link generated without apiKey because client auth is disabled");
+        warn!(
+            "CC Switch import deep link generated without apiKey because client auth is disabled"
+        );
     }
 
     let bind_host: IpAddr = config.server.host.parse()?;
     let bind_port = config.server.port;
 
     let state = AppState {
-        config,
+        config: Arc::clone(&config),
         client,
         metrics,
         upstream_auth,
+        account_pool: Arc::clone(&account_pool),
     };
+
+    if config.upstream.auth_mode == AuthMode::AccountPool {
+        let refresh_manager = Arc::clone(&account_pool);
+        tokio::spawn(async move {
+            let interval = refresh_manager.quota_refresh_interval();
+            loop {
+                tokio::time::sleep(interval).await;
+                if let Err(err) = refresh_manager.refresh_all_quotas().await {
+                    warn!(error = %err, "background account pool quota refresh failed");
+                }
+            }
+        });
+    }
+
     let listener = tokio::net::TcpListener::bind((bind_host, bind_port)).await?;
 
     axum::serve(listener, build_app(state)).await?;
+    Ok(())
+}
+
+fn parse_cli_command() -> anyhow::Result<CliCommand> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        return Ok(CliCommand::Serve);
+    }
+
+    if args[0] != "pool" {
+        anyhow::bail!(
+            "unknown command: {} (supported: pool login|list|enable|disable|remove|refresh)",
+            args[0]
+        );
+    }
+
+    let subcommand = args.get(1).map(String::as_str).unwrap_or("list");
+    let pool_command = match subcommand {
+        "login" => PoolCommand::Login {
+            alias: args.get(2).cloned(),
+        },
+        "list" => PoolCommand::List,
+        "enable" => PoolCommand::Enable {
+            account: args
+                .get(2)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("usage: pool enable <account-id-or-alias>"))?,
+        },
+        "disable" => PoolCommand::Disable {
+            account: args
+                .get(2)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("usage: pool disable <account-id-or-alias>"))?,
+        },
+        "remove" => PoolCommand::Remove {
+            account: args
+                .get(2)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("usage: pool remove <account-id-or-alias>"))?,
+        },
+        "refresh" => PoolCommand::Refresh,
+        _ => {
+            anyhow::bail!(
+                "unknown pool subcommand: {subcommand} (supported: login|list|enable|disable|remove|refresh)"
+            );
+        }
+    };
+
+    Ok(CliCommand::Pool(pool_command))
+}
+
+async fn run_pool_command(
+    manager: &Arc<AccountPoolManager>,
+    command: PoolCommand,
+) -> anyhow::Result<()> {
+    match command {
+        PoolCommand::Login { alias } => {
+            let session = manager.begin_device_login().await?;
+            if let Some(url) = session.verification_uri_complete.as_deref() {
+                println!("Open this URL to authorize:\n{url}");
+            } else {
+                println!("Open this URL: {}", session.verification_uri);
+            }
+            println!("Then enter this code: {}", session.user_code);
+            let summary = manager.complete_device_login(&session, alias).await?;
+            println!(
+                "Added account: alias={} id={} enabled={}",
+                summary.alias, summary.id, summary.enabled
+            );
+        }
+        PoolCommand::List => {
+            let accounts = manager.list_accounts().await?;
+            if accounts.is_empty() {
+                println!("No account pool entries.");
+            } else {
+                for account in accounts {
+                    println!(
+                        "id={} alias={} enabled={} remaining={} reset_at={} expires_at={} last_used_at={} last_error={}",
+                        account.id,
+                        account.alias,
+                        account.enabled,
+                        account
+                            .remaining
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        account
+                            .reset_at
+                            .map(format_reset_time_iso)
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        account
+                            .expires_at
+                            .map(format_reset_time_iso)
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        account
+                            .last_used_at
+                            .map(format_reset_time_iso)
+                            .unwrap_or_else(|| "never".to_string()),
+                        account.last_error.unwrap_or_else(|| "-".to_string()),
+                    );
+                }
+            }
+        }
+        PoolCommand::Enable { account } => {
+            let summary = manager.set_enabled(&account, true).await?;
+            println!("Enabled account: alias={} id={}", summary.alias, summary.id);
+        }
+        PoolCommand::Disable { account } => {
+            let summary = manager.set_enabled(&account, false).await?;
+            println!(
+                "Disabled account: alias={} id={}",
+                summary.alias, summary.id
+            );
+        }
+        PoolCommand::Remove { account } => {
+            let summary = manager.remove(&account).await?;
+            println!("Removed account: alias={} id={}", summary.alias, summary.id);
+        }
+        PoolCommand::Refresh => {
+            manager.refresh_all_quotas().await?;
+            println!("Account pool quota refresh completed.");
+        }
+    }
     Ok(())
 }
 
@@ -157,9 +332,24 @@ async fn create_message(
 
     let resp = match execute_upstream_request(&state, "/responses", &openai_body, None).await {
         Ok(resp) => resp,
-        Err(err) => {
+        Err(UpstreamRequestError::AccountPoolExhausted { reset_at }) => {
+            metrics_handle.fail();
+            return account_pool_exhausted_response(reset_at);
+        }
+        Err(UpstreamRequestError::Request(err)) => {
             metrics_handle.fail();
             error!(request_id = metrics_handle.id(), error = %err, "upstream request failed");
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                json!({
+                    "type": "error",
+                    "error": {"type": "api_error", "message": err.to_string()}
+                }),
+            );
+        }
+        Err(UpstreamRequestError::Internal(err)) => {
+            metrics_handle.fail();
+            error!(request_id = metrics_handle.id(), error = %err, "internal upstream routing failed");
             return error_response(
                 StatusCode::BAD_GATEWAY,
                 json!({
@@ -242,9 +432,21 @@ async fn stream_response(
 ) -> Response<Body> {
     let resp = match execute_upstream_request(&state, "/responses", &openai_body, None).await {
         Ok(resp) => resp,
-        Err(err) => {
+        Err(UpstreamRequestError::AccountPoolExhausted { reset_at }) => {
+            metrics_handle.fail();
+            return sse_error_response(account_pool_exhausted_body(reset_at));
+        }
+        Err(UpstreamRequestError::Request(err)) => {
             metrics_handle.fail();
             error!(request_id = metrics_handle.id(), error = %err, "failed to open upstream SSE stream");
+            return sse_error_response(json!({
+                "type": "error",
+                "error": {"type": "api_error", "message": err.to_string()}
+            }));
+        }
+        Err(UpstreamRequestError::Internal(err)) => {
+            metrics_handle.fail();
+            error!(request_id = metrics_handle.id(), error = %err, "internal upstream routing failed");
             return sse_error_response(json!({
                 "type": "error",
                 "error": {"type": "api_error", "message": err.to_string()}
@@ -382,13 +584,26 @@ async fn count_tokens(
             );
             Json(json!({"input_tokens": estimated})).into_response()
         }
-        Err(err) => {
+        Err(UpstreamRequestError::AccountPoolExhausted { reset_at }) => {
+            warn!(
+                reset_at = ?reset_at.map(format_reset_time_iso),
+                "account pool exhausted for count_tokens"
+            );
+            account_pool_exhausted_response(reset_at)
+        }
+        Err(UpstreamRequestError::Request(err)) => {
             warn!(error = %err, "upstream input_tokens request errored; using fallback");
             let estimated = estimate_tokens_from_body(&body);
             info!(
                 estimated,
                 "count-tokens fallback used after upstream request error"
             );
+            Json(json!({"input_tokens": estimated})).into_response()
+        }
+        Err(UpstreamRequestError::Internal(err)) => {
+            warn!(error = %err, "internal upstream routing errored; using fallback");
+            let estimated = estimate_tokens_from_body(&body);
+            info!(estimated, "count-tokens fallback used after internal error");
             Json(json!({"input_tokens": estimated})).into_response()
         }
     }
@@ -399,7 +614,21 @@ async fn execute_upstream_request(
     endpoint: &str,
     body: &Value,
     timeout: Option<Duration>,
-) -> Result<reqwest::Response, reqwest::Error> {
+) -> Result<reqwest::Response, UpstreamRequestError> {
+    match state.config.upstream.auth_mode {
+        AuthMode::AccountPool => execute_account_pool_request(state, endpoint, body, timeout).await,
+        AuthMode::LocalCodex | AuthMode::ConfigApiKey => {
+            execute_legacy_upstream_request(state, endpoint, body, timeout).await
+        }
+    }
+}
+
+async fn execute_legacy_upstream_request(
+    state: &AppState,
+    endpoint: &str,
+    body: &Value,
+    timeout: Option<Duration>,
+) -> Result<reqwest::Response, UpstreamRequestError> {
     let base_body = body.clone();
     let mut credential = state.upstream_auth.resolve_primary().await;
     let mut request_body = prepare_upstream_body(&base_body, &credential);
@@ -408,7 +637,9 @@ async fn execute_upstream_request(
         endpoint,
     );
     let mut response =
-        send_upstream_request(&state.client, &url, &request_body, timeout, &credential).await?;
+        send_upstream_request(&state.client, &url, &request_body, timeout, &credential)
+            .await
+            .map_err(UpstreamRequestError::Request)?;
 
     if is_auth_error(response.status())
         && credential.source == CredentialSource::LocalCodexAccessToken
@@ -422,7 +653,8 @@ async fn execute_upstream_request(
             );
             response =
                 send_upstream_request(&state.client, &url, &request_body, timeout, &refreshed)
-                    .await?;
+                    .await
+                    .map_err(UpstreamRequestError::Request)?;
             credential = refreshed;
         }
     }
@@ -437,11 +669,101 @@ async fn execute_upstream_request(
             );
             response =
                 send_upstream_request(&state.client, &url, &request_body, timeout, &configured)
-                    .await?;
+                    .await
+                    .map_err(UpstreamRequestError::Request)?;
         }
     }
 
     Ok(response)
+}
+
+async fn execute_account_pool_request(
+    state: &AppState,
+    endpoint: &str,
+    body: &Value,
+    timeout: Option<Duration>,
+) -> Result<reqwest::Response, UpstreamRequestError> {
+    let mut attempted_ids = HashSet::new();
+    let first = select_account_pool_credential(state, &attempted_ids).await?;
+    attempted_ids.insert(first.id.clone());
+
+    let mut credential = ResolvedCredential {
+        token: first.access_token.clone(),
+        source: CredentialSource::AccountPoolAccessToken,
+        account_id: first.account_id.clone(),
+    };
+    let base_body = body.clone();
+    let mut request_body = prepare_upstream_body(&base_body, &credential);
+    let mut url = join_upstream_url(
+        upstream_base_url(&state.config.upstream, &credential),
+        endpoint,
+    );
+    let mut response =
+        send_upstream_request(&state.client, &url, &request_body, timeout, &credential)
+            .await
+            .map_err(UpstreamRequestError::Request)?;
+    let first_status = response.status();
+    let first_headers = response.headers().clone();
+    if let Err(err) = state
+        .account_pool
+        .update_quota_from_response(&first.id, &first_headers, first_status)
+        .await
+    {
+        warn!(error = %err, "failed updating account pool quota metadata");
+    }
+
+    if is_account_pool_retry_status(first_status) {
+        match select_account_pool_credential(state, &attempted_ids).await {
+            Ok(next) => {
+                attempted_ids.insert(next.id.clone());
+                credential = ResolvedCredential {
+                    token: next.access_token.clone(),
+                    source: CredentialSource::AccountPoolAccessToken,
+                    account_id: next.account_id.clone(),
+                };
+                request_body = prepare_upstream_body(&base_body, &credential);
+                url = join_upstream_url(
+                    upstream_base_url(&state.config.upstream, &credential),
+                    endpoint,
+                );
+                response =
+                    send_upstream_request(&state.client, &url, &request_body, timeout, &credential)
+                        .await
+                        .map_err(UpstreamRequestError::Request)?;
+                let second_status = response.status();
+                let second_headers = response.headers().clone();
+                if let Err(err) = state
+                    .account_pool
+                    .update_quota_from_response(&next.id, &second_headers, second_status)
+                    .await
+                {
+                    warn!(error = %err, "failed updating account pool quota metadata");
+                }
+            }
+            Err(UpstreamRequestError::AccountPoolExhausted { reset_at }) => {
+                if first_status == StatusCode::TOO_MANY_REQUESTS {
+                    return Err(UpstreamRequestError::AccountPoolExhausted { reset_at });
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(response)
+}
+
+async fn select_account_pool_credential(
+    state: &AppState,
+    attempted_ids: &HashSet<String>,
+) -> Result<account_pool::PoolCredential, UpstreamRequestError> {
+    let excluded: Vec<String> = attempted_ids.iter().cloned().collect();
+    match state.account_pool.select_account(&excluded).await {
+        Ok(AccountSelection::Selected(credential)) => Ok(credential),
+        Ok(AccountSelection::Exhausted { reset_at }) => {
+            Err(UpstreamRequestError::AccountPoolExhausted { reset_at })
+        }
+        Err(err) => Err(UpstreamRequestError::Internal(err)),
+    }
 }
 
 async fn send_upstream_request(
@@ -521,6 +843,10 @@ fn is_auth_error(status: StatusCode) -> bool {
     status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN
 }
 
+fn is_account_pool_retry_status(status: StatusCode) -> bool {
+    is_auth_error(status) || status == StatusCode::TOO_MANY_REQUESTS
+}
+
 fn check_auth(config: &AppConfig, headers: &HeaderMap) -> Option<Response<Body>> {
     if !config.auth_enabled() {
         return None;
@@ -562,6 +888,25 @@ fn error_response(status: StatusCode, body: Value) -> Response<Body> {
     let mut response = Json(body).into_response();
     *response.status_mut() = status;
     response
+}
+
+fn account_pool_exhausted_body(reset_at: Option<SystemTime>) -> Value {
+    let reset_at_iso = reset_at.map(format_reset_time_iso);
+    json!({
+        "type": "error",
+        "error": {
+            "type": "rate_limit_error",
+            "message": "All account pool entries are exhausted",
+            "reset_at": reset_at_iso,
+        }
+    })
+}
+
+fn account_pool_exhausted_response(reset_at: Option<SystemTime>) -> Response<Body> {
+    error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        account_pool_exhausted_body(reset_at),
+    )
 }
 
 fn sse_error_response(body: Value) -> Response<Body> {
@@ -626,10 +971,7 @@ fn mask_api_key(api_key: &str) -> String {
     }
 
     let prefix: String = api_key.chars().take(4).collect();
-    let suffix: String = api_key
-        .chars()
-        .skip(char_count.saturating_sub(4))
-        .collect();
+    let suffix: String = api_key.chars().skip(char_count.saturating_sub(4)).collect();
     format!("{prefix}...{suffix}")
 }
 
@@ -705,12 +1047,30 @@ mod tests {
             upstream: config::UpstreamConfig {
                 base_url: "https://api.openai.com/v1".to_string(),
                 api_key: "configured-key".to_string(),
+                auth_mode: AuthMode::ConfigApiKey,
                 prefer_local_codex_credentials: false,
                 local_codex_auth_path: "~/.codex/auth.json".to_string(),
                 refresh_local_codex_tokens: true,
                 local_codex_oauth_client_id: None,
                 local_codex_oauth_token_endpoint: None,
                 codex_base_url: Some(DEFAULT_CODEX_BASE_URL.to_string()),
+                account_pool: config::AccountPoolConfig {
+                    store_path: config::DEFAULT_ACCOUNT_POOL_STORE_PATH.to_string(),
+                    quota_refresh_interval_secs: config::DEFAULT_ACCOUNT_POOL_REFRESH_INTERVAL_SECS,
+                    quota_remaining_header: config::DEFAULT_ACCOUNT_POOL_QUOTA_REMAINING_HEADER
+                        .to_string(),
+                    quota_reset_header: config::DEFAULT_ACCOUNT_POOL_QUOTA_RESET_HEADER.to_string(),
+                    oauth_client_id: None,
+                    oauth_scopes: vec![
+                        "openid".to_string(),
+                        "profile".to_string(),
+                        "email".to_string(),
+                        "offline_access".to_string(),
+                    ],
+                    openid_config_url: config::DEFAULT_OPENID_CONFIG_URL.to_string(),
+                    oauth_token_endpoint: None,
+                    oauth_device_authorization_endpoint: None,
+                },
             },
             model_map: HashMap::new(),
         }

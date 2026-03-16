@@ -11,6 +11,12 @@ use uuid::Uuid;
 
 pub const DEFAULT_UPSTREAM_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+pub const DEFAULT_OPENID_CONFIG_URL: &str =
+    "https://auth.openai.com/.well-known/openid-configuration";
+pub const DEFAULT_ACCOUNT_POOL_STORE_PATH: &str = "~/.codextocc/account-pool.json";
+pub const DEFAULT_ACCOUNT_POOL_QUOTA_REMAINING_HEADER: &str = "x-ratelimit-remaining-requests";
+pub const DEFAULT_ACCOUNT_POOL_QUOTA_RESET_HEADER: &str = "x-ratelimit-reset-requests";
+pub const DEFAULT_ACCOUNT_POOL_REFRESH_INTERVAL_SECS: u64 = 30;
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -30,12 +36,53 @@ pub struct ServerConfig {
 pub struct UpstreamConfig {
     pub base_url: String,
     pub api_key: String,
+    pub auth_mode: AuthMode,
     pub prefer_local_codex_credentials: bool,
     pub local_codex_auth_path: String,
     pub refresh_local_codex_tokens: bool,
     pub local_codex_oauth_client_id: Option<String>,
     pub local_codex_oauth_token_endpoint: Option<String>,
     pub codex_base_url: Option<String>,
+    pub account_pool: AccountPoolConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMode {
+    LocalCodex,
+    ConfigApiKey,
+    AccountPool,
+}
+
+impl AuthMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "local_codex" => Some(Self::LocalCodex),
+            "config_api_key" => Some(Self::ConfigApiKey),
+            "account_pool" => Some(Self::AccountPool),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalCodex => "local_codex",
+            Self::ConfigApiKey => "config_api_key",
+            Self::AccountPool => "account_pool",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AccountPoolConfig {
+    pub store_path: String,
+    pub quota_refresh_interval_secs: u64,
+    pub quota_remaining_header: String,
+    pub quota_reset_header: String,
+    pub oauth_client_id: Option<String>,
+    pub oauth_scopes: Vec<String>,
+    pub openid_config_url: String,
+    pub oauth_token_endpoint: Option<String>,
+    pub oauth_device_authorization_endpoint: Option<String>,
 }
 
 #[derive(Debug)]
@@ -44,7 +91,7 @@ pub enum ConfigLoad {
     Generated { path: PathBuf },
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 struct RawConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     server: Option<RawServerConfig>,
@@ -56,7 +103,7 @@ struct RawConfig {
     model_map: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 struct RawServerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     host: Option<String>,
@@ -64,12 +111,14 @@ struct RawServerConfig {
     port: Option<u16>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 struct RawUpstreamConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefer_local_codex_credentials: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -82,6 +131,42 @@ struct RawUpstreamConfig {
     local_codex_oauth_token_endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     codex_base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_pool: Option<RawAccountPoolConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+struct RawAccountPoolConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quota_refresh_interval_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quota_headers: Option<RawAccountPoolQuotaHeaders>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oauth: Option<RawAccountPoolOAuthConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    openid_config_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oauth_token_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oauth_device_authorization_endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+struct RawAccountPoolQuotaHeaders {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remaining: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reset: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+struct RawAccountPoolOAuthConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scopes: Option<Vec<String>>,
 }
 
 impl AppConfig {
@@ -116,6 +201,30 @@ impl AppConfig {
     fn from_raw(raw: RawConfig) -> Self {
         let server = raw.server.unwrap_or_default();
         let upstream = raw.upstream.unwrap_or_default();
+        let account_pool = upstream.account_pool.clone().unwrap_or_default();
+        let account_pool_quota_headers = account_pool.quota_headers.clone().unwrap_or_default();
+        let account_pool_oauth = account_pool.oauth.clone().unwrap_or_default();
+        let prefer_local_codex_credentials = env_bool("PREFER_LOCAL_CODEX_CREDENTIALS")
+            .or(upstream.prefer_local_codex_credentials)
+            .unwrap_or(false);
+        let auth_mode = env::var("AUTH_MODE")
+            .ok()
+            .as_deref()
+            .and_then(AuthMode::parse)
+            .or_else(|| upstream.auth_mode.as_deref().and_then(AuthMode::parse))
+            .unwrap_or_else(|| {
+                if prefer_local_codex_credentials {
+                    AuthMode::LocalCodex
+                } else {
+                    AuthMode::ConfigApiKey
+                }
+            });
+        let account_pool_oauth_scopes = env::var("ACCOUNT_POOL_OAUTH_SCOPES")
+            .ok()
+            .map(|value| split_csv_like_list(&value))
+            .or(account_pool_oauth.scopes)
+            .filter(|scopes| !scopes.is_empty())
+            .unwrap_or_else(default_account_pool_scopes);
 
         Self {
             server: ServerConfig {
@@ -132,9 +241,8 @@ impl AppConfig {
                     .ok()
                     .or(upstream.api_key)
                     .unwrap_or_default(),
-                prefer_local_codex_credentials: env_bool("PREFER_LOCAL_CODEX_CREDENTIALS")
-                    .or(upstream.prefer_local_codex_credentials)
-                    .unwrap_or(false),
+                auth_mode,
+                prefer_local_codex_credentials,
                 local_codex_auth_path: env::var("LOCAL_CODEX_AUTH_PATH")
                     .ok()
                     .or(upstream.local_codex_auth_path)
@@ -154,6 +262,45 @@ impl AppConfig {
                     .ok()
                     .or(upstream.codex_base_url)
                     .filter(|value| !value.is_empty()),
+                account_pool: AccountPoolConfig {
+                    store_path: env::var("ACCOUNT_POOL_PATH")
+                        .ok()
+                        .or(account_pool.store_path)
+                        .unwrap_or_else(|| DEFAULT_ACCOUNT_POOL_STORE_PATH.to_string()),
+                    quota_refresh_interval_secs: env_u64("ACCOUNT_POOL_REFRESH_INTERVAL_SECS")
+                        .or(account_pool.quota_refresh_interval_secs)
+                        .unwrap_or(DEFAULT_ACCOUNT_POOL_REFRESH_INTERVAL_SECS),
+                    quota_remaining_header: env::var("ACCOUNT_POOL_QUOTA_REMAINING_HEADER")
+                        .ok()
+                        .or(account_pool_quota_headers.remaining)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| DEFAULT_ACCOUNT_POOL_QUOTA_REMAINING_HEADER.to_string()),
+                    quota_reset_header: env::var("ACCOUNT_POOL_QUOTA_RESET_HEADER")
+                        .ok()
+                        .or(account_pool_quota_headers.reset)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| DEFAULT_ACCOUNT_POOL_QUOTA_RESET_HEADER.to_string()),
+                    oauth_client_id: env::var("ACCOUNT_POOL_OAUTH_CLIENT_ID")
+                        .ok()
+                        .or(account_pool_oauth.client_id)
+                        .filter(|value| !value.is_empty()),
+                    oauth_scopes: account_pool_oauth_scopes,
+                    openid_config_url: env::var("ACCOUNT_POOL_OPENID_CONFIG_URL")
+                        .ok()
+                        .or(account_pool.openid_config_url)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| DEFAULT_OPENID_CONFIG_URL.to_string()),
+                    oauth_token_endpoint: env::var("ACCOUNT_POOL_OAUTH_TOKEN_ENDPOINT")
+                        .ok()
+                        .or(account_pool.oauth_token_endpoint)
+                        .filter(|value| !value.is_empty()),
+                    oauth_device_authorization_endpoint: env::var(
+                        "ACCOUNT_POOL_OAUTH_DEVICE_AUTHORIZATION_ENDPOINT",
+                    )
+                    .ok()
+                    .or(account_pool.oauth_device_authorization_endpoint)
+                    .filter(|value| !value.is_empty()),
+                },
             },
             model_map: raw.model_map.unwrap_or_default(),
         }
@@ -183,12 +330,28 @@ fn generate_default_config(path: &Path) -> anyhow::Result<()> {
         upstream: Some(RawUpstreamConfig {
             base_url: Some(DEFAULT_UPSTREAM_BASE_URL.to_string()),
             api_key: Some(String::new()),
+            auth_mode: Some(AuthMode::LocalCodex.as_str().to_string()),
             prefer_local_codex_credentials: Some(true),
             local_codex_auth_path: Some("~/.codex/auth.json".to_string()),
             refresh_local_codex_tokens: Some(true),
             local_codex_oauth_client_id: None,
             local_codex_oauth_token_endpoint: None,
             codex_base_url: Some(DEFAULT_CODEX_BASE_URL.to_string()),
+            account_pool: Some(RawAccountPoolConfig {
+                store_path: Some(DEFAULT_ACCOUNT_POOL_STORE_PATH.to_string()),
+                quota_refresh_interval_secs: Some(DEFAULT_ACCOUNT_POOL_REFRESH_INTERVAL_SECS),
+                quota_headers: Some(RawAccountPoolQuotaHeaders {
+                    remaining: Some(DEFAULT_ACCOUNT_POOL_QUOTA_REMAINING_HEADER.to_string()),
+                    reset: Some(DEFAULT_ACCOUNT_POOL_QUOTA_RESET_HEADER.to_string()),
+                }),
+                oauth: Some(RawAccountPoolOAuthConfig {
+                    client_id: None,
+                    scopes: Some(default_account_pool_scopes()),
+                }),
+                openid_config_url: Some(DEFAULT_OPENID_CONFIG_URL.to_string()),
+                oauth_token_endpoint: None,
+                oauth_device_authorization_endpoint: None,
+            }),
         }),
         model_map: Some(HashMap::new()),
     };
@@ -213,12 +376,36 @@ fn env_bool(name: &str) -> Option<bool> {
     env::var(name).ok().and_then(|value| parse_bool(&value))
 }
 
+fn env_u64(name: &str) -> Option<u64> {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
 fn parse_bool(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+fn split_csv_like_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn default_account_pool_scopes() -> Vec<String> {
+    vec![
+        "openid".to_string(),
+        "profile".to_string(),
+        "email".to_string(),
+        "offline_access".to_string(),
+    ]
 }
 
 #[cfg(test)]
@@ -239,12 +426,24 @@ mod tests {
             upstream: UpstreamConfig {
                 base_url: DEFAULT_UPSTREAM_BASE_URL.to_string(),
                 api_key: "configured-key".to_string(),
+                auth_mode: AuthMode::ConfigApiKey,
                 prefer_local_codex_credentials: false,
                 local_codex_auth_path: "~/.codex/auth.json".to_string(),
                 refresh_local_codex_tokens: true,
                 local_codex_oauth_client_id: None,
                 local_codex_oauth_token_endpoint: None,
                 codex_base_url: Some(DEFAULT_CODEX_BASE_URL.to_string()),
+                account_pool: AccountPoolConfig {
+                    store_path: DEFAULT_ACCOUNT_POOL_STORE_PATH.to_string(),
+                    quota_refresh_interval_secs: DEFAULT_ACCOUNT_POOL_REFRESH_INTERVAL_SECS,
+                    quota_remaining_header: DEFAULT_ACCOUNT_POOL_QUOTA_REMAINING_HEADER.to_string(),
+                    quota_reset_header: DEFAULT_ACCOUNT_POOL_QUOTA_RESET_HEADER.to_string(),
+                    oauth_client_id: None,
+                    oauth_scopes: default_account_pool_scopes(),
+                    openid_config_url: DEFAULT_OPENID_CONFIG_URL.to_string(),
+                    oauth_token_endpoint: None,
+                    oauth_device_authorization_endpoint: None,
+                },
             },
             model_map: HashMap::new(),
         }
@@ -338,6 +537,10 @@ mod tests {
             Some(DEFAULT_UPSTREAM_BASE_URL)
         );
         assert_eq!(upstream.api_key.as_deref(), Some(""));
+        assert_eq!(
+            upstream.auth_mode.as_deref(),
+            Some(AuthMode::LocalCodex.as_str())
+        );
         assert_eq!(upstream.prefer_local_codex_credentials, Some(true));
         assert_eq!(
             upstream.local_codex_auth_path.as_deref(),
@@ -347,6 +550,35 @@ mod tests {
         assert_eq!(
             upstream.codex_base_url.as_deref(),
             Some(DEFAULT_CODEX_BASE_URL)
+        );
+        let account_pool = upstream.account_pool.expect("missing account_pool");
+        assert_eq!(
+            account_pool.store_path.as_deref(),
+            Some(DEFAULT_ACCOUNT_POOL_STORE_PATH)
+        );
+        assert_eq!(
+            account_pool.quota_refresh_interval_secs,
+            Some(DEFAULT_ACCOUNT_POOL_REFRESH_INTERVAL_SECS)
+        );
+        let quota_headers = account_pool
+            .quota_headers
+            .expect("missing account_pool quota_headers");
+        assert_eq!(
+            quota_headers.remaining.as_deref(),
+            Some(DEFAULT_ACCOUNT_POOL_QUOTA_REMAINING_HEADER)
+        );
+        assert_eq!(
+            quota_headers.reset.as_deref(),
+            Some(DEFAULT_ACCOUNT_POOL_QUOTA_RESET_HEADER)
+        );
+        let oauth = account_pool.oauth.expect("missing account_pool oauth");
+        assert_eq!(
+            oauth.scopes.unwrap_or_default(),
+            default_account_pool_scopes()
+        );
+        assert_eq!(
+            account_pool.openid_config_url.as_deref(),
+            Some(DEFAULT_OPENID_CONFIG_URL)
         );
 
         assert!(raw.model_map.expect("missing model_map").is_empty());
@@ -381,8 +613,13 @@ model_map:
         assert_eq!(config.server.port, 9090);
         assert_eq!(config.api_keys, HashSet::from(["secret".to_string()]));
         assert_eq!(config.upstream.base_url, "https://example.com/v1");
+        assert_eq!(config.upstream.auth_mode, AuthMode::ConfigApiKey);
         assert!(!config.upstream.prefer_local_codex_credentials);
         assert_eq!(config.upstream.codex_base_url, None);
+        assert_eq!(
+            config.upstream.account_pool.store_path,
+            DEFAULT_ACCOUNT_POOL_STORE_PATH
+        );
         assert_eq!(
             config.model_map.get("claude").map(String::as_str),
             Some("gpt")
@@ -403,6 +640,56 @@ model_map:
             err.to_string()
                 .contains("config path exists but is not a file"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn auth_mode_falls_back_to_legacy_prefer_local_flag() {
+        let raw = RawConfig {
+            server: None,
+            api_keys: None,
+            upstream: Some(RawUpstreamConfig {
+                base_url: None,
+                api_key: None,
+                auth_mode: None,
+                prefer_local_codex_credentials: Some(true),
+                local_codex_auth_path: None,
+                refresh_local_codex_tokens: None,
+                local_codex_oauth_client_id: None,
+                local_codex_oauth_token_endpoint: None,
+                codex_base_url: None,
+                account_pool: None,
+            }),
+            model_map: None,
+        };
+        assert_eq!(
+            AppConfig::from_raw(raw).upstream.auth_mode,
+            AuthMode::LocalCodex
+        );
+    }
+
+    #[test]
+    fn auth_mode_honors_explicit_value() {
+        let raw = RawConfig {
+            server: None,
+            api_keys: None,
+            upstream: Some(RawUpstreamConfig {
+                base_url: None,
+                api_key: None,
+                auth_mode: Some("account_pool".to_string()),
+                prefer_local_codex_credentials: Some(false),
+                local_codex_auth_path: None,
+                refresh_local_codex_tokens: None,
+                local_codex_oauth_client_id: None,
+                local_codex_oauth_token_endpoint: None,
+                codex_base_url: None,
+                account_pool: None,
+            }),
+            model_map: None,
+        };
+        assert_eq!(
+            AppConfig::from_raw(raw).upstream.auth_mode,
+            AuthMode::AccountPool
         );
     }
 }

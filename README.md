@@ -6,7 +6,7 @@ Rust proxy that translates Anthropic-style `/v1/messages` requests into OpenAI R
 
 The server loads configuration from `config.yaml` by default. Set `CONFIG_PATH` to use a different file.
 
-If the configured path does not exist at startup, the server generates a new config file, writes a random 32-character lowercase hex client API key to `api_keys`, enables local Codex credential lookup, and exits immediately. The generated key is only written to the config file, not printed to the terminal.
+If the configured path does not exist at startup, the server generates a new config file, writes a random 32-character lowercase hex client API key to `api_keys`, and exits immediately.
 
 Environment variables override YAML values when both are present.
 
@@ -20,9 +20,16 @@ Environment variables override YAML values when both are present.
 ### Client auth fields
 
 - `api_keys`
-  Optional list of client API keys accepted by this proxy. If omitted or empty, client auth is disabled. Auto-generated configs include one random key by default.
+  Optional list of client API keys accepted by this proxy. If omitted or empty, client auth is disabled.
 
-### Upstream fields
+### Upstream auth mode
+
+- `upstream.auth_mode`
+  Values: `local_codex | config_api_key | account_pool`
+  Default: derived from legacy `upstream.prefer_local_codex_credentials` (`true => local_codex`, `false => config_api_key`)
+  Env override: `AUTH_MODE`
+
+### Common upstream fields
 
 - `upstream.base_url`
   Default: `https://api.openai.com/v1`
@@ -30,34 +37,14 @@ Environment variables override YAML values when both are present.
 - `upstream.api_key`
   Default: empty
   Env override: `OPENAI_API_KEY`
-- `upstream.prefer_local_codex_credentials`
-  Default: `false`
-  Env override: `PREFER_LOCAL_CODEX_CREDENTIALS`
-  Auto-generated configs set this to `true`
-- `upstream.local_codex_auth_path`
-  Default: `~/.codex/auth.json`
-  Env override: `LOCAL_CODEX_AUTH_PATH`
-- `upstream.refresh_local_codex_tokens`
-  Default: `true`
-  Env override: `REFRESH_LOCAL_CODEX_TOKENS`
-- `upstream.local_codex_oauth_client_id`
-  Default: derived from `tokens.id_token.aud[0]`
-  Env override: `LOCAL_CODEX_OAUTH_CLIENT_ID`
-- `upstream.local_codex_oauth_token_endpoint`
-  Default: discovered from OpenID configuration
-  Env override: `LOCAL_CODEX_OAUTH_TOKEN_ENDPOINT`
 - `upstream.codex_base_url`
   Default: `https://chatgpt.com/backend-api/codex`
   Env override: `CODEX_BASE_URL`
-  Used when sending requests with local Codex OAuth credentials to avoid missing `api.responses.*` scopes.
+  Used for local Codex OAuth and account pool OAuth credentials.
 
-## Local Codex Credentials
+## Legacy local Codex mode (`auth_mode=local_codex`)
 
-This proxy can optionally read upstream credentials from the local Codex credential file, which is `~/.codex/auth.json` by default.
-
-Auto-generated configs enable this behavior on the next startup and leave `upstream.api_key` empty as an optional fallback you can add later.
-
-Supported fields from that file:
+Supported local file fields (`~/.codex/auth.json` by default):
 
 - `OPENAI_API_KEY`
 - `tokens.access_token`
@@ -65,26 +52,94 @@ Supported fields from that file:
 - `tokens.id_token`
 - `tokens.account_id`
 
-When `upstream.prefer_local_codex_credentials` is enabled, upstream auth resolution is:
+Legacy fields:
 
-1. `OPENAI_API_KEY` from the local Codex auth file
-2. `tokens.access_token` from the local Codex auth file
-3. `refresh_token` refresh flow for a local access token
-4. configured `OPENAI_API_KEY` / `upstream.api_key`
+- `upstream.prefer_local_codex_credentials`
+  Env override: `PREFER_LOCAL_CODEX_CREDENTIALS`
+- `upstream.local_codex_auth_path`
+  Env override: `LOCAL_CODEX_AUTH_PATH`
+- `upstream.refresh_local_codex_tokens`
+  Env override: `REFRESH_LOCAL_CODEX_TOKENS`
+- `upstream.local_codex_oauth_client_id`
+  Env override: `LOCAL_CODEX_OAUTH_CLIENT_ID`
+- `upstream.local_codex_oauth_token_endpoint`
+  Env override: `LOCAL_CODEX_OAUTH_TOKEN_ENDPOINT`
 
-If the proxy refreshes a local Codex access token successfully, it updates the token fields in the local auth file and uses an atomic replace to avoid partial writes.
+Resolution order in this mode:
 
-## Failure Behavior
+1. `OPENAI_API_KEY` from local file
+2. local `tokens.access_token`
+3. local `refresh_token` flow
+4. configured `upstream.api_key`
 
-- Missing or malformed local auth file: falls back to configured `upstream.api_key`
-- Missing local `OPENAI_API_KEY` and unusable local token: falls back to configured `upstream.api_key`
-- Upstream `401` or `403` while using a local access token: invalidates the cached token, reloads the local file, attempts one refresh, then retries once
-- Upstream `401` or `403` after local credential failure: retries once with configured `upstream.api_key` if present
-- `count_tokens` keeps its existing local estimation fallback if the upstream call still fails
+## Account pool mode (`auth_mode=account_pool`)
 
-## Security Notes
+This mode is fully decoupled from local Codex credentials and does not read/write `~/.codex/auth.json`.
+
+### Account pool config fields
+
+- `upstream.account_pool.store_path`
+  Default: `~/.codextocc/account-pool.json`
+  Env override: `ACCOUNT_POOL_PATH`
+- `upstream.account_pool.quota_refresh_interval_secs`
+  Default: `30`
+  Env override: `ACCOUNT_POOL_REFRESH_INTERVAL_SECS`
+- `upstream.account_pool.quota_headers.remaining`
+  Default: `x-ratelimit-remaining-requests`
+  Env override: `ACCOUNT_POOL_QUOTA_REMAINING_HEADER`
+- `upstream.account_pool.quota_headers.reset`
+  Default: `x-ratelimit-reset-requests`
+  Env override: `ACCOUNT_POOL_QUOTA_RESET_HEADER`
+- `upstream.account_pool.oauth.client_id`
+  Required for `pool login`
+  Env override: `ACCOUNT_POOL_OAUTH_CLIENT_ID`
+- `upstream.account_pool.oauth.scopes`
+  Default: `["openid","profile","email","offline_access"]`
+  Env override: `ACCOUNT_POOL_OAUTH_SCOPES` (comma-separated)
+- `upstream.account_pool.openid_config_url`
+  Default: `https://auth.openai.com/.well-known/openid-configuration`
+  Env override: `ACCOUNT_POOL_OPENID_CONFIG_URL`
+- `upstream.account_pool.oauth_token_endpoint`
+  Optional override
+  Env override: `ACCOUNT_POOL_OAUTH_TOKEN_ENDPOINT`
+- `upstream.account_pool.oauth_device_authorization_endpoint`
+  Optional override
+  Env override: `ACCOUNT_POOL_OAUTH_DEVICE_AUTHORIZATION_ENDPOINT`
+
+### Device-code OAuth management commands
+
+- `codextocc pool login [alias]`
+  Starts OAuth device-code login, prints verification URL + code, polls until authorized.
+- `codextocc pool list`
+- `codextocc pool enable <id-or-alias>`
+- `codextocc pool disable <id-or-alias>`
+- `codextocc pool remove <id-or-alias>`
+- `codextocc pool refresh`
+  Manually refreshes quota metadata for enabled accounts.
+
+### Account selection and failover
+
+- Selection prefers:
+  1. enabled accounts with usable tokens and `remaining > 0`
+  2. earlier `reset_at`
+  3. higher `remaining`
+  4. least recently used (`last_used_at`)
+- Accounts with unknown quota are lower priority but still usable.
+- On `401/403/429`, proxy retries once with the next eligible pool account.
+- If all accounts are exhausted, proxy returns `429` with `error.reset_at` (ISO8601 when available).
+
+## Failure behavior summary
+
+- `auth_mode=config_api_key`: only uses configured `upstream.api_key`
+- `auth_mode=local_codex`: keeps legacy local-file + fallback behavior
+- `auth_mode=account_pool`:
+  - no local Codex fallback
+  - no configured API key fallback
+  - exhausted pool returns `429`
+
+## Security notes
 
 - Do not commit `config.yaml` with real secrets.
-- Do not commit `~/.codex/auth.json`.
+- Do not commit `~/.codex/auth.json` or account pool store files.
+- Account pool tokens are stored in plain JSON with file permission hardening (`0600` on Unix) and atomic replace writes.
 - This proxy never logs raw credential values.
-- Treat local Codex credential support as optional compatibility behavior. Configured API-key auth remains the stable baseline.

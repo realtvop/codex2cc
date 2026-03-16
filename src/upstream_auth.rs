@@ -13,7 +13,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::warn;
 
-use crate::config::UpstreamConfig;
+use crate::config::{AuthMode, UpstreamConfig};
 
 const OPENID_CONFIG_URL: &str = "https://auth.openai.com/.well-known/openid-configuration";
 const TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(60);
@@ -23,11 +23,15 @@ pub enum CredentialSource {
     ConfigApiKey,
     LocalCodexApiKey,
     LocalCodexAccessToken,
+    AccountPoolAccessToken,
 }
 
 impl CredentialSource {
     pub fn is_local(&self) -> bool {
-        matches!(self, Self::LocalCodexApiKey | Self::LocalCodexAccessToken)
+        matches!(
+            self,
+            Self::LocalCodexApiKey | Self::LocalCodexAccessToken | Self::AccountPoolAccessToken
+        )
     }
 }
 
@@ -109,7 +113,7 @@ impl UpstreamAuthManager {
 
     pub async fn resolve_primary(&self) -> ResolvedCredential {
         let configured = self.configured_credential();
-        if !self.config.prefer_local_codex_credentials {
+        if self.config.auth_mode != AuthMode::LocalCodex {
             return configured;
         }
 
@@ -124,7 +128,7 @@ impl UpstreamAuthManager {
     }
 
     pub async fn resolve_after_token_unauthorized(&self) -> Option<ResolvedCredential> {
-        if !self.config.prefer_local_codex_credentials {
+        if self.config.auth_mode != AuthMode::LocalCodex {
             return None;
         }
 
@@ -562,12 +566,32 @@ mod tests {
         UpstreamConfig {
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: api_key.to_string(),
+            auth_mode: AuthMode::ConfigApiKey,
             prefer_local_codex_credentials: false,
             local_codex_auth_path: "~/.codex/auth.json".to_string(),
             refresh_local_codex_tokens: true,
             local_codex_oauth_client_id: None,
             local_codex_oauth_token_endpoint: None,
             codex_base_url: None,
+            account_pool: crate::config::AccountPoolConfig {
+                store_path: crate::config::DEFAULT_ACCOUNT_POOL_STORE_PATH.to_string(),
+                quota_refresh_interval_secs:
+                    crate::config::DEFAULT_ACCOUNT_POOL_REFRESH_INTERVAL_SECS,
+                quota_remaining_header: crate::config::DEFAULT_ACCOUNT_POOL_QUOTA_REMAINING_HEADER
+                    .to_string(),
+                quota_reset_header: crate::config::DEFAULT_ACCOUNT_POOL_QUOTA_RESET_HEADER
+                    .to_string(),
+                oauth_client_id: None,
+                oauth_scopes: vec![
+                    "openid".to_string(),
+                    "profile".to_string(),
+                    "email".to_string(),
+                    "offline_access".to_string(),
+                ],
+                openid_config_url: crate::config::DEFAULT_OPENID_CONFIG_URL.to_string(),
+                oauth_token_endpoint: None,
+                oauth_device_authorization_endpoint: None,
+            },
         }
     }
 
