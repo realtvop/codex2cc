@@ -66,7 +66,17 @@ pub fn anthropic_to_openai_request(body: &Value, model_map: &HashMap<String, Str
                 .get("budget_tokens")
                 .and_then(Value::as_i64)
                 .unwrap_or(1024);
-            let effort = if budget >= 8192 {
+            let effort = if model.starts_with("gpt") {
+                if budget >= 8192 {
+                    "xhigh"
+                } else if budget >= 2048 {
+                    "high"
+                } else if budget >= 512 {
+                    "medium"
+                } else {
+                    "low"
+                }
+            } else if budget >= 8192 {
                 "high"
             } else if budget >= 2048 {
                 "medium"
@@ -846,6 +856,7 @@ mod tests {
     fn anthropic_request_maps_reasoning_effort_and_tool_choice_shortcuts() {
         let model_map = HashMap::new();
 
+        // Non-GPT model: budget thresholds unchanged
         for (budget, expected_effort) in [(1024, "low"), (2048, "medium"), (8192, "high")] {
             let body = json!({
                 "model": "claude",
@@ -862,6 +873,29 @@ mod tests {
                 json!({"effort": expected_effort, "summary": "auto"})
             );
             assert_eq!(request["tool_choice"], json!("auto"));
+        }
+
+        // GPT model: xhigh tier at 8192, shifted thresholds
+        let mut gpt_map = HashMap::new();
+        gpt_map.insert("claude-3".to_string(), "gpt-5".to_string());
+        for (budget, expected_effort) in [
+            (256, "low"),
+            (512, "medium"),
+            (2048, "high"),
+            (8192, "xhigh"),
+        ] {
+            let body = json!({
+                "model": "claude-3",
+                "messages": [],
+                "thinking": {"type": "enabled", "budget_tokens": budget}
+            });
+
+            let request = anthropic_to_openai_request(&body, &gpt_map);
+            assert_eq!(
+                request["reasoning"],
+                json!({"effort": expected_effort, "summary": "auto"}),
+                "GPT model with budget {budget} should map to effort \"{expected_effort}\""
+            );
         }
 
         let required = anthropic_to_openai_request(
